@@ -1,0 +1,21 @@
+Version 3.1.0
+=============
+
+Enhancements
+------------
+
+* Added support for lazily retrieving bulk data values referenced by a
+  "BulkDataURI" in the DICOM JSON Model through the new ``lazy_bulk_data``
+  keyword argument of :meth:`~pydicom.dataset.Dataset.from_json`. With lazy
+  bulk data, elements with a VR of **OB**, **OW** or **UN** keep a
+  :class:`~pydicom.bulkdata.BulkDataReference` (see
+  :attr:`~pydicom.dataelem.DataElement.is_lazy_bulk`) instead of retrieving
+  the value while the JSON is parsed. The value is retrieved on explicit
+  access of :attr:`~pydicom.dataelem.DataElement.value`, or streamed
+  directly to the output - without being loaded into memory - when the
+  dataset is written with :func:`~pydicom.filewriter.dcmwrite` or
+  :meth:`~pydicom.dataset.Dataset.save_as` using a native little endian
+  transfer syntax. Unretrieved values are serialized back to their original
+  "BulkDataURI" by :meth:`~pydicom.dataset.Dataset.to_json` and
+  :meth:`~pydicom.dataset.Dataset.to_json_dict`. Retrieval failures raise
+  :class:`~pydicom.bulkdata.BulkDataError`.

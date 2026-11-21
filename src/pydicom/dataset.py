@@ -14,6 +14,7 @@ Dataset (dict subclass)
         * A Sequence (list subclass), where each item is a Dataset which
             contains its own DataElements, and so on in a recursive manner.
 """
+
 import copy
 import io
 import json
@@ -51,6 +52,7 @@ except ImportError:
 import pydicom  # for dcmwrite
 from pydicom import jsonrep, config
 from pydicom._version import __version_info__
+from pydicom.bulkdata import BulkDataStreamHandlerType
 from pydicom.charset import default_encoding, convert_encodings
 from pydicom.config import logger
 from pydicom.datadict import (
@@ -75,7 +77,6 @@ from pydicom.tag import Tag, BaseTag, tag_in_exception, TagType, TAG_PIXREP
 from pydicom.uid import PYDICOM_IMPLEMENTATION_UID, UID
 from pydicom.valuerep import VR as VR_, AMBIGUOUS_VR
 from pydicom.waveforms import numpy_handler as wave_handler
-
 
 # FloatPixelData, DoubleFloatPixelData, PixelData
 PIXEL_KEYWORDS = {0x7FE00008, 0x7FE00009, 0x7FE00010}
@@ -3066,8 +3067,11 @@ class Dataset:
         bulk_data_uri_handler: (
             Callable[[str, str, str], None | str | int | float | bytes]
             | Callable[[str], None | str | int | float | bytes]
+            | BulkDataStreamHandlerType
             | None
         ) = None,
+        *,
+        lazy_bulk_data: bool = False,
     ) -> "Dataset":
         """Return a :class:`Dataset` from a DICOM JSON Model object.
 
@@ -3089,10 +3093,61 @@ class Dataset:
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
 
+            If `lazy_bulk_data` is ``True`` the handler must instead accept
+            the three arguments ``(tag, vr, uri)`` - with `tag` being the
+            element tag as an uppercase hex string such as ``"7FE00010"`` -
+            and return a ``(stream, length)`` tuple for each call, where
+            `stream` is a newly opened readable binary stream for the value
+            and `length` is the number of payload bytes (without padding) as
+            a non-negative :class:`int`. The stream doesn't have to be
+            seekable and may return fewer bytes than requested from
+            ``read(n)``; an empty read signals the end of the stream. The
+            stream is closed by *pydicom* once it has been consumed or when
+            an error occurs. The payload shall be the native (uncompressed)
+            value of the element in little endian byte order.
+        lazy_bulk_data : bool, optional
+            If ``False`` (default), the value of an element with a
+            "BulkDataURI" is retrieved immediately while the JSON is parsed,
+            using `bulk_data_uri_handler`.
+
+            If ``True``, retrieval of elements with a VR of **OB**, **OW** or
+            **UN** and a "BulkDataURI" is deferred: the created
+            :class:`~pydicom.dataelem.DataElement` holds a
+            :class:`~pydicom.bulkdata.BulkDataReference` (see
+            :attr:`~pydicom.dataelem.DataElement.is_lazy_bulk`) and
+            `bulk_data_uri_handler` is not called while the JSON is parsed
+            (this also applies to elements nested in sequences). The value is
+            retrieved later, when:
+
+            * the element's :attr:`~pydicom.dataelem.DataElement.value` is
+              accessed explicitly (including via the corresponding
+              :class:`Dataset` keyword attribute) - the value is retrieved
+              and returned as :class:`bytes`, and only that element is
+              affected, or
+            * the dataset is written with
+              :func:`~pydicom.filewriter.dcmwrite` or
+              :meth:`~Dataset.save_as` - the value is streamed directly to
+              the output and the element keeps its unretrieved reference.
+
+            Reading other elements, iterating the dataset, testing for
+            element presence and printing the dataset do not retrieve bulk
+            data values, and neither does :meth:`~Dataset.to_json` or
+            :meth:`~Dataset.to_json_dict` (an unretrieved value is
+            serialized with its original "BulkDataURI"). Replacing or
+            deleting an element with an unretrieved value discards the
+            reference without retrieving it.
+
+            A "BulkDataURI" for any other VR is rejected with a
+            :class:`ValueError`, as is using ``lazy_bulk_data=True`` without
+            a `bulk_data_uri_handler`.
+
         Returns
         -------
         Dataset
         """
+        if lazy_bulk_data:
+            jsonrep._validate_lazy_bulk_handler(bulk_data_uri_handler)  # type: ignore[arg-type]
+
         if isinstance(json_dataset, str | bytes | bytearray):
             json_dataset = cast(dict[str, Any], json.loads(json_dataset))
 
@@ -3113,7 +3168,13 @@ class Dataset:
                 value_key = unique_value_keys[0]
                 value = mapping[value_key]
             data_element = DataElement.from_json(
-                cls, tag, vr, value, value_key, bulk_data_uri_handler
+                cls,
+                tag,
+                vr,
+                value,
+                value_key,
+                bulk_data_uri_handler,
+                lazy_bulk_data=lazy_bulk_data,
             )
             dataset.add(data_element)
         return dataset

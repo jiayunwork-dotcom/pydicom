@@ -99,3 +99,93 @@ or, if you need to also know the tag and the vr, in addition to the stored
   >>>     "00091002": {"vr": "OB", "BulkDataURI": "https://my.wado.org/123"}
   >>> }
   >>> ds = Dataset.from_json(json_data, bulk_data_uri_handler=bulk_data_reader)
+
+Deferring bulk data retrieval
+=============================
+
+.. versionadded:: 3.1
+
+When a dataset is archived through DICOMweb, its metadata is available as
+DICOM JSON while the bulk data values (such as *Pixel Data*) are only
+available through their ``BulkDataURI``. Downloading those values can be
+expensive, so it may be desirable to defer the retrieval until the value is
+actually needed. Passing ``lazy_bulk_data=True`` to
+:meth:`~pydicom.dataset.Dataset.from_json` keeps this order: the JSON is
+parsed, ordinary attributes can be inspected and modified, and the bulk data
+is only retrieved when a value is explicitly accessed or the dataset is
+written to a DICOM file:
+
+  >>> json_data = {
+  >>>     "00100010": {"vr": "PN", "Value": [{"Alphabetic": "CITIZEN^Joan"}]},
+  >>>     "7FE00010": {"vr": "OW", "BulkDataURI": "https://my.wado.org/123"},
+  >>> }
+  >>> ds = Dataset.from_json(
+  >>>     json_data, bulk_data_uri_handler=bulk_data_streamer,
+  >>>     lazy_bulk_data=True,
+  >>> )
+
+In lazy mode the ``bulk_data_uri_handler`` is **not** called while the JSON
+is parsed (this also applies to elements nested in sequences). It must accept
+the three arguments ``(tag, vr, uri)`` - with `tag` being the element tag as
+an uppercase hex string such as ``"7FE00010"`` - and return a
+``(stream, length)`` tuple for each call:
+
+  >>> def bulk_data_streamer(tag, vr, uri):
+  >>>     response = http_get(uri)  # open a new stream for this call
+  >>>     return response.raw_stream, response.content_length
+
+* ``stream`` is a newly opened readable binary stream for the value. It
+  doesn't have to be seekable and may return fewer bytes than requested from
+  ``read(n)``; an empty read signals the end of the stream. The stream is
+  closed by *pydicom* once it has been consumed or when an error occurs.
+* ``length`` is the number of payload bytes (without padding) as a
+  non-negative :class:`int`. The payload shall be the native (uncompressed)
+  value of the element in little endian byte order. For a VR of **OW** the
+  length must be even.
+
+Only elements with a VR of **OB**, **OW** or **UN** can be deferred; a
+``BulkDataURI`` for any other VR raises a :class:`ValueError` when the JSON
+is parsed, as does using ``lazy_bulk_data=True`` without a handler.
+
+Elements with an unretrieved value are real
+:class:`~pydicom.dataelem.DataElement` instances whose value is a
+:class:`~pydicom.bulkdata.BulkDataReference`; use
+:attr:`~pydicom.dataelem.DataElement.is_lazy_bulk` and
+:attr:`~pydicom.dataelem.DataElement.bulk_data_uri` to inspect them. Reading
+other elements, iterating the dataset, testing for element presence and
+printing the dataset do not retrieve the bulk data, and neither do
+:meth:`~pydicom.dataset.Dataset.to_json` and
+:meth:`~pydicom.dataset.Dataset.to_json_dict` - an unretrieved value is
+serialized with its original ``BulkDataURI`` regardless of
+``bulk_data_threshold``. Replacing or deleting such an element discards the
+reference without retrieving it.
+
+The value is retrieved on explicit access only:
+
+  >>> ds.PatientName  # ordinary attribute - no retrieval
+  'CITIZEN^Joan'
+  >>> pixel_data = ds[0x7FE00010].value  # retrieves and returns bytes
+  >>> pixel_data = ds.PixelData  # keyword access also retrieves
+
+Accessing the value retrieves it once and stores it as :class:`bytes` on that
+element only; the other references are unaffected.
+
+When the dataset is written with :func:`~pydicom.filewriter.dcmwrite` or
+:meth:`~pydicom.dataset.Dataset.save_as`, unretrieved values are streamed
+directly to the output in chunks of at most 1 MiB without being loaded into
+memory, and the elements keep their unretrieved references afterwards (a
+later write retrieves them again). This requires a file path or a seekable
+binary file object as the output and the *Explicit VR Little Endian* or
+*Implicit VR Little Endian* transfer syntax; other outputs and transfer
+syntaxes are rejected with a :class:`ValueError` before any URI is accessed.
+**OB** and **UN** values with an odd length are padded with a zero byte as
+required by the DICOM Standard.
+
+All retrieval failures - a handler that raises, an invalid length, a stream
+that ends early, contains extra bytes or fails during ``read()`` - raise
+:class:`~pydicom.bulkdata.BulkDataError`. The error message identifies the
+URI, the element tag and, for nested elements, the containing sequence
+items. The element keeps its unretrieved reference, so the operation can be
+retried (for example with a new stream) once the problem is fixed. A failed
+write may leave an incomplete output file and is never reported as
+successful; a file object provided by the caller is not closed by *pydicom*.

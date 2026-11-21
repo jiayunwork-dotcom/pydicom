@@ -12,10 +12,15 @@ from collections.abc import Callable, MutableSequence
 import copy
 from io import BufferedIOBase
 import json
-from typing import Any, TYPE_CHECKING, NamedTuple
+from typing import Any, TYPE_CHECKING, NamedTuple, cast
 
 from pydicom import config  # don't import datetime_conversion directly
 from pydicom.config import logger
+from pydicom.bulkdata import (
+    BulkDataReference,
+    BulkDataStreamHandlerType,
+    LAZY_BULK_DATA_VRS,
+)
 from pydicom.datadict import (
     dictionary_has_tag,
     dictionary_description,
@@ -222,6 +227,7 @@ class DataElement:
             VR == VR_.UN
             and not tag.is_private
             and config.replace_un_with_known_vr
+            and not isinstance(value, BulkDataReference)
             and (is_undefined_length or value is None or len(value) < 0xFFFF)
         ):
             try:
@@ -258,8 +264,11 @@ class DataElement:
         bulk_data_uri_handler: (
             Callable[[str, str, str], BulkDataType]
             | Callable[[str], BulkDataType]
+            | BulkDataStreamHandlerType
             | None
         ) = None,
+        *,
+        lazy_bulk_data: bool = False,
     ) -> "DataElement":
         """Return a :class:`DataElement` from a DICOM JSON Model attribute
         object.
@@ -288,13 +297,35 @@ class DataElement:
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
 
+            If `lazy_bulk_data` is ``True`` the handler must accept the three
+            arguments `tag`, `vr` and `value` and return a
+            ``(stream, length)`` tuple instead; it is not called while the
+            JSON is being parsed. See
+            :meth:`Dataset.from_json()<pydicom.dataset.Dataset.from_json>`
+            for the full handler contract.
+        lazy_bulk_data : bool, optional
+            If ``True``, an element with a VR of **OB**, **OW** or **UN** and
+            a "BulkDataURI" is created with a
+            :class:`~pydicom.bulkdata.BulkDataReference` as its value instead
+            of retrieving the value immediately (default ``False``). Other
+            VRs using a "BulkDataURI" are rejected with a :class:`ValueError`.
+
         Returns
         -------
         DataElement
         """
+        if lazy_bulk_data:
+            jsonrep._validate_lazy_bulk_handler(bulk_data_uri_handler)  # type: ignore[arg-type]
+
         # TODO: test wado-rs retrieve wrapper
         converter = JsonDataElementConverter(
-            dataset_class, tag, vr, value, value_key, bulk_data_uri_handler
+            dataset_class,
+            tag,
+            vr,
+            value,
+            value_key,
+            bulk_data_uri_handler,
+            lazy_bulk_data=lazy_bulk_data,
         )
         elem_value = converter.get_element_values()
 
@@ -342,7 +373,13 @@ class DataElement:
             Mapping representing a JSON encoded data element as ``{str: Any}``.
         """
         json_element: dict[str, Any] = {"vr": self.VR}
-        if self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS}:
+        if isinstance(self._value, BulkDataReference):
+            # An unretrieved bulk data value is serialized with its original
+            #   "BulkDataURI" as-is - the value is not retrieved and neither
+            #   the retrieval handler nor a `bulk_data_element_handler` is
+            #   called, regardless of `bulk_data_threshold`
+            json_element["BulkDataURI"] = self._value.uri
+        elif self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS}:
             if not self.is_empty:
                 binary_value = self.value
                 # Base64 makes the encoded value 1/3 longer.
@@ -457,12 +494,32 @@ class DataElement:
         Returns
         -------
         Any
-            The element's value.
+            The element's value. If the element's value is an unretrieved
+            :class:`~pydicom.bulkdata.BulkDataReference` (see
+            :meth:`Dataset.from_json(..., lazy_bulk_data=True)
+            <pydicom.dataset.Dataset.from_json>`) then getting the value
+            retrieves the bulk data and returns it as :class:`bytes`; only
+            this element is affected.
         """
+        if isinstance(self._value, BulkDataReference):
+            self._materialize_bulk_data()
+
         return self._value
 
     @value.setter
     def value(self, val: Any) -> None:
+        # A lazily retrieved bulk data value (see Dataset.from_json())
+        if isinstance(val, BulkDataReference):
+            if self.VR not in LAZY_BULK_DATA_VRS:
+                raise ValueError(
+                    f"Elements with a VR of '{self.VR}' cannot be used with "
+                    "lazy bulk data values, supported VRs are: "
+                    f"{', '.join(LAZY_BULK_DATA_VRS)}"
+                )
+
+            self._value = val
+            return
+
         # O* elements set using a buffer object
         if isinstance(val, BufferedIOBase):
             if self.VR not in BUFFERABLE_VRS:
@@ -496,6 +553,16 @@ class DataElement:
 
         self._value = self._convert_value(val)
 
+    def _materialize_bulk_data(self) -> None:
+        """Retrieve a lazily loaded bulk data value and store it as bytes.
+
+        Only called if the element's value is a
+        :class:`~pydicom.bulkdata.BulkDataReference`. If retrieval fails the
+        reference is kept, so the access can be retried.
+        """
+        ref = cast(BulkDataReference, self._value)
+        self._value = ref.read_all()
+
     @property
     def VM(self) -> int:
         """Return the value multiplicity of the element as :class:`int`.
@@ -505,6 +572,10 @@ class DataElement:
             **SQ** elements now always return a VM of ``1``.
         """
         if self.VR == VR_.SQ:
+            return 1
+
+        if isinstance(self._value, BulkDataReference):
+            # An unretrieved bulk data value always has VM 1
             return 1
 
         if self.value is None:
@@ -532,6 +603,28 @@ class DataElement:
         instance, ``False`` otherwise.
         """
         return isinstance(self._value, BufferedIOBase)
+
+    @property
+    def is_lazy_bulk(self) -> bool:
+        """Return ``True`` if the element's value is an unretrieved
+        :class:`~pydicom.bulkdata.BulkDataReference`, ``False`` otherwise.
+
+        .. versionadded:: 3.1
+        """
+        return isinstance(self._value, BulkDataReference)
+
+    @property
+    def bulk_data_uri(self) -> str | None:
+        """Return the URI of the element's unretrieved bulk data value as
+        :class:`str`, or ``None`` if the element's value is not an
+        unretrieved :class:`~pydicom.bulkdata.BulkDataReference`.
+
+        .. versionadded:: 3.1
+        """
+        if isinstance(self._value, BulkDataReference):
+            return self._value.uri
+
+        return None
 
     @property
     def is_empty(self) -> bool:
@@ -683,6 +776,12 @@ class DataElement:
             if self.tag != other.tag or self.VR != other.VR:
                 return False
 
+            # Two unretrieved bulk data values are compared by their
+            #   references (tag, VR and URI) without retrieving them;
+            #   comparing against a non-reference value requires retrieval
+            if self.is_lazy_bulk and other.is_lazy_bulk:
+                return self._value == other._value
+
             # tag and VR match, now check the value
             if config.have_numpy and isinstance(self.value, numpy.ndarray):
                 return len(self.value) == len(other.value) and numpy.allclose(
@@ -721,6 +820,10 @@ class DataElement:
     @property
     def repval(self) -> str:
         """Return a :class:`str` representation of the element's value."""
+        if isinstance(self._value, BulkDataReference):
+            # don't retrieve the bulk data value just to display it
+            return f"Bulk data not yet retrieved from '{self._value.uri}'"
+
         if self.is_buffered:
             # in case the buffer is a stream and non-seekable we don't want
             # to consume any bytes

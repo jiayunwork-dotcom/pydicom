@@ -10,6 +10,7 @@ from collections.abc import Callable
 import zlib
 
 from pydicom import config
+from pydicom.bulkdata import BulkDataReference, BulkDataError
 from pydicom.charset import default_encoding, convert_encodings, encode_string
 from pydicom.dataelem import (
     convert_raw_data_element,
@@ -40,6 +41,7 @@ from pydicom.uid import (
     DeflatedExplicitVRLittleEndian,
     UID,
     ImplicitVRLittleEndian,
+    ExplicitVRLittleEndian,
     ExplicitVRBigEndian,
 )
 from pydicom.valuerep import (
@@ -616,6 +618,135 @@ def write_TM(fp: DicomIO, elem: DataElement) -> None:
         fp.write(val)
 
 
+def _element_has_lazy_bulk(elem: DataElement) -> bool:
+    """Return ``True`` if `elem` is or contains an unretrieved lazy bulk
+    data value.
+    """
+    if elem.is_lazy_bulk:
+        return True
+
+    if elem.VR == VR.SQ:
+        return any(
+            _dataset_has_lazy_bulk(item) for item in cast(Iterable[Dataset], elem.value)
+        )
+
+    return False
+
+
+def _dataset_has_lazy_bulk(ds: Dataset) -> bool:
+    """Return ``True`` if `ds` or any nested sequence item contains an
+    unretrieved lazy bulk data value.
+    """
+    return any(
+        _element_has_lazy_bulk(elem)
+        for elem in ds.values()
+        if isinstance(elem, DataElement)
+    )
+
+
+def _write_lazy_bulk_element(fp: DicomIO, elem: DataElement) -> None:
+    """Write an element whose value is an unretrieved bulk data reference.
+
+    The payload is streamed directly to `fp` in chunks without being loaded
+    into memory, and the element's value remains an unretrieved
+    :class:`~pydicom.bulkdata.BulkDataReference` afterwards. The length of
+    the value is known from the retrieval handler before any payload byte is
+    read, so the encoded element uses a defined length.
+
+    Parameters
+    ----------
+    fp : pydicom.filebase.DicomIO
+        The file-like to write the encoded element to, must use little
+        endian encoding.
+    elem : dataelem.DataElement
+        The element with the lazy bulk data value to write.
+    """
+    ref = cast(BulkDataReference, elem._value)
+    if not fp.is_little_endian:
+        raise BulkDataError(
+            f"Cannot write the lazy bulk data element {elem.tag} using a big "
+            "endian encoding - lazy bulk data values are only supported with "
+            "little endian transfer syntaxes"
+        )
+
+    stream, length = ref.open()
+    try:
+        # OW has already been validated as even length by open(), so the
+        #   padding only applies to OB and UN
+        padded_length = length + length % 2
+        fp.write_tag(elem.tag)
+        if not fp.is_implicit_VR:
+            # OB, OW and UN all use a 32-bit length field with explicit VR
+            fp.write(bytes(elem.VR, default_encoding))
+            fp.write_US(0)  # reserved 2 bytes
+
+        fp.write_UL(padded_length)
+
+        written = 0
+        for chunk in ref.chunks(stream, length):
+            written += fp.write(chunk)
+
+        if padded_length != length:
+            # OB and UN values with an odd length are padded with 0x00
+            fp.write(b"\x00")
+            written += 1
+
+        if written != padded_length:
+            raise BulkDataError(
+                f"Failed to write the value of the lazy bulk data element "
+                f"{elem.tag}: only {written} of {padded_length} bytes were "
+                "written"
+            )
+    finally:
+        stream.close()
+
+
+def _write_lazy_sequence(
+    fp: DicomIO, elem: DataElement, encodings: str | list[str] | None
+) -> None:
+    """Write a sequence element that contains lazy bulk data values.
+
+    The sequence items are written directly to `fp` (which must be seekable)
+    so that contained lazy bulk data payloads can be streamed without being
+    buffered in memory; the defined lengths of the sequence and its items
+    are patched in afterwards by seeking back.
+
+    Parameters
+    ----------
+    fp : pydicom.filebase.DicomIO
+        The seekable file-like to write the encoded element to.
+    elem : dataelem.DataElement
+        The sequence element to write.
+    encodings : list of str or None
+        The character encodings to use on text values.
+    """
+    encodings = convert_encodings(encodings or [default_encoding])
+    fp.write_tag(elem.tag)
+    if not fp.is_implicit_VR:
+        fp.write(b"SQ")
+        fp.write_US(0)  # reserved 2 bytes
+
+    length_location = fp.tell()
+    fp.write_UL(0xFFFFFFFF if elem.is_undefined_length else 0)
+    for index, item in enumerate(cast(Iterable[Dataset], elem.value)):
+        try:
+            write_sequence_item(fp, item, encodings)
+        except Exception as exc:
+            raise type(exc)(
+                f"{exc}\n  ... raised while writing item {index} of "
+                f"sequence element {elem.tag}"
+            ) from exc
+
+    if elem.is_undefined_length:
+        fp.write_tag(SequenceDelimiterTag)
+        fp.write_UL(0)  # 4-byte 'length' of delimiter data item
+    else:
+        end_location = fp.tell()
+        fp.seek(length_location)
+        fp.write_UL(end_location - length_location - 4)
+        fp.seek(end_location)  # ready for the next data element
+
+
 def write_data_element(
     fp: DicomIO,
     elem: DataElement | RawDataElement,
@@ -624,6 +755,18 @@ def write_data_element(
     """Write the data_element to file fp according to
     dicom media storage rules.
     """
+    if isinstance(elem, DataElement):
+        if elem.is_lazy_bulk:
+            # Stream the unretrieved bulk data value directly to the output
+            _write_lazy_bulk_element(fp, elem)
+            return
+
+        if elem.VR == VR.SQ and _element_has_lazy_bulk(elem):
+            # Stream the sequence items so contained lazy bulk data values
+            #   don't have to be buffered in memory
+            _write_lazy_sequence(fp, elem, encodings)
+            return
+
     # Write element's tag
     fp.write_tag(elem.tag)
 
@@ -681,7 +824,7 @@ def write_data_element(
             pixel_data_bytes = cast(bytes, elem.value)[:4]
 
         # Big endian encapsulation is non-conformant
-        tag = b"\xFE\xFF\x00\xE0" if fp.is_little_endian else b"\xFF\xFE\xE0\x00"
+        tag = b"\xfe\xff\x00\xe0" if fp.is_little_endian else b"\xff\xfe\xe0\x00"
         if not pixel_data_bytes.startswith(tag):
             raise ValueError(
                 "The (7FE0,0010) 'Pixel Data' element value hasn't been "
@@ -738,6 +881,75 @@ def write_data_element(
     if is_undefined_length:
         fp.write_tag(SequenceDelimiterTag)
         fp.write_UL(0)  # 4-byte 'length' of delimiter data item
+
+
+def _is_seekable(fp: DicomIO) -> bool:
+    """Return ``True`` if `fp` is a seekable output, ``False`` otherwise."""
+    buffer = fp.parent if isinstance(fp, DicomIO) else fp
+    seekable = getattr(buffer, "seekable", None)
+    if callable(seekable):
+        try:
+            return bool(seekable())
+        except Exception:
+            return False
+
+    try:
+        fp.seek(fp.tell())
+    except Exception:
+        return False
+
+    return True
+
+
+def _validate_lazy_bulk_write(
+    fp: DicomIO, tsyntax: UID | None, encoding: tuple[bool, bool]
+) -> None:
+    """Validate that a dataset containing lazy bulk data values can be
+    written to `fp`.
+
+    Called before any bulk data URI is accessed, so an unsupported output or
+    transfer syntax is rejected without retrieving any bulk data.
+
+    Parameters
+    ----------
+    fp : pydicom.filebase.DicomIO
+        The file-like the dataset will be written to.
+    tsyntax : pydicom.uid.UID or None
+        The transfer syntax the dataset will be encoded with (if any).
+    encoding : tuple[bool, bool]
+        The encoding to use as ``(is_implicit_VR, is_little_endian)``.
+
+    Raises
+    ------
+    ValueError
+        If the transfer syntax is not a native little endian transfer
+        syntax, or the output is not seekable.
+    """
+    if (
+        tsyntax is not None
+        and tsyntax.is_transfer_syntax
+        and tsyntax not in (ExplicitVRLittleEndian, ImplicitVRLittleEndian)
+    ):
+        raise ValueError(
+            "Cannot write a dataset containing unretrieved bulk data values "
+            f"with the '{tsyntax.name}' transfer syntax - only 'Explicit VR "
+            "Little Endian' and 'Implicit VR Little Endian' are supported"
+        )
+
+    if not encoding[1]:
+        raise ValueError(
+            "Cannot write a dataset containing unretrieved bulk data values "
+            "using a big endian encoding - only little endian is supported"
+        )
+
+    # Patching in the defined lengths of sequences and items requires a
+    #   seekable output
+    if not _is_seekable(fp):
+        raise ValueError(
+            "Cannot write a dataset containing unretrieved bulk data values "
+            "to a non-seekable output - use a file path or a seekable "
+            "binary file object"
+        )
 
 
 EncodingType = tuple[bool | None, bool | None]
@@ -1220,6 +1432,23 @@ def dcmwrite(
         **UN** must be converted manually prior to calling
         :func:`~pydicom.filewriter.dcmwrite`.
 
+    .. versionadded:: 3.1
+
+        Support for writing unretrieved lazy bulk data values.
+
+    If `dataset` contains elements with unretrieved lazy bulk data values
+    (see :meth:`Dataset.from_json(..., lazy_bulk_data=True)
+    <pydicom.dataset.Dataset.from_json>`), the values are streamed directly
+    to the output in chunks of at most 1 MiB without being loaded into
+    memory, and the elements keep their unretrieved references afterwards.
+    This requires a seekable output and a native little endian transfer
+    syntax (*Explicit VR Little Endian* or *Implicit VR Little Endian*);
+    other outputs and transfer syntaxes are rejected with a
+    :class:`ValueError` before any bulk data URI is accessed. Retrieval
+    failures raise :class:`~pydicom.bulkdata.BulkDataError` and may leave an
+    incomplete output file; a file-like `filename` provided by the caller is
+    not closed.
+
     Parameters
     ----------
     filename : str, PathLike, file-like or writeable buffer
@@ -1425,6 +1654,12 @@ def dcmwrite(
 
     # Set the encoding of the buffer/file-like
     fp.is_implicit_VR, fp.is_little_endian = encoding
+
+    # If the dataset contains unretrieved bulk data values, make sure the
+    #   output and transfer syntax support streaming them before any bulk
+    #   data URI is accessed
+    if _dataset_has_lazy_bulk(dataset):
+        _validate_lazy_bulk_write(fp, tsyntax, encoding)
 
     try:
         if preamble:

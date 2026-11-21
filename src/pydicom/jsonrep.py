@@ -6,6 +6,11 @@ from inspect import signature
 from typing import TypeAlias, Any, cast, TYPE_CHECKING
 from collections.abc import Callable
 
+from pydicom.bulkdata import (
+    BulkDataReference,
+    BulkDataStreamHandlerType,
+    LAZY_BULK_DATA_VRS,
+)
 from pydicom.misc import warn_and_log
 from pydicom.valuerep import FLOAT_VR, INT_VR, VR
 
@@ -14,6 +19,49 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 JSON_VALUE_KEYS = ("Value", "BulkDataURI", "InlineBinary")
+
+
+def _validate_lazy_bulk_handler(
+    handler: BulkDataStreamHandlerType | None,
+) -> None:
+    """Validate the `bulk_data_uri_handler` used for lazy bulk data retrieval.
+
+    The handler is validated without being called.
+
+    Parameters
+    ----------
+    handler : callable or None
+        The retrieval handler passed to
+        :meth:`~pydicom.dataset.Dataset.from_json` or
+        :meth:`~pydicom.dataelem.DataElement.from_json`.
+
+    Raises
+    ------
+    ValueError
+        If `handler` is ``None`` or cannot be called with the three
+        positional arguments ``(tag, vr, uri)``.
+    """
+    if handler is None:
+        raise ValueError(
+            "A 'bulk_data_uri_handler' is required when 'lazy_bulk_data' is " "True"
+        )
+
+    try:
+        sig = signature(handler)
+    except (TypeError, ValueError):
+        # The signature cannot be inspected (e.g. some callables implemented
+        #   in C) - accept it and let a wrong signature fail when the
+        #   handler is actually called
+        return
+
+    try:
+        sig.bind("tag", "vr", "uri")
+    except TypeError as exc:
+        raise ValueError(
+            "The 'bulk_data_uri_handler' must accept three positional "
+            "arguments (tag, vr, uri) when 'lazy_bulk_data' is True: "
+            f"{exc}"
+        ) from exc
 
 
 def convert_to_python_number(value: Any, vr: str) -> Any:
@@ -94,8 +142,12 @@ class JsonDataElementConverter:
         value: JSONValueType,
         value_key: str | None,
         bulk_data_uri_handler: (
-            BulkDataHandlerType | Callable[[str], BulkDataType] | None
+            BulkDataHandlerType
+            | Callable[[str], BulkDataType]
+            | BulkDataStreamHandlerType
+            | None
         ) = None,
+        lazy_bulk_data: bool = False,
     ) -> None:
         """Create a new converter instance.
 
@@ -124,16 +176,33 @@ class JsonDataElementConverter:
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the
             `vr` (i.e. the Value Multiplicity will be 0).
+
+            If `lazy_bulk_data` is ``True`` the handler must accept the three
+            arguments `tag`, `vr` and the "BulkDataURI" `value` and return a
+            ``(stream, length)`` tuple instead; it is not called while the
+            JSON is being parsed. See
+            :meth:`Dataset.from_json()<pydicom.dataset.Dataset.from_json>`
+            for the full handler contract.
+        lazy_bulk_data : bool, optional
+            If ``True``, elements with a VR of **OB**, **OW** or **UN** and a
+            "BulkDataURI" are created with a
+            :class:`~pydicom.bulkdata.BulkDataReference` as their value
+            instead of retrieving the value immediately (default ``False``).
         """
         self.dataset_class = dataset_class
         self.tag = tag
         self.vr = vr
         self.value = value
         self.value_key = value_key
+        self.lazy_bulk_data = lazy_bulk_data
         self.bulk_data_element_handler: BulkDataHandlerType
 
         handler = bulk_data_uri_handler
-        if handler and len(signature(handler).parameters) == 1:
+        if lazy_bulk_data:
+            # The handler is stored as-is and is only called when the value
+            #   is actually retrieved; it must not be wrapped or called here
+            self.bulk_data_element_handler = cast(BulkDataHandlerType, handler)
+        elif handler and len(signature(handler).parameters) == 1:
             # `handler` is Callable[[str], BulkDataType]
             def wrapper(tag: str, vr: str, value: str) -> BulkDataType:
                 x = cast(Callable[[str], BulkDataType], handler)
@@ -201,6 +270,24 @@ class JsonDataElementConverter:
                     f"Invalid attribute value for data element '{self.tag}' - "
                     "the value for 'BulkDataURI' must be str, not "
                     f"{type(value).__name__}"
+                )
+
+            if self.lazy_bulk_data:
+                if self.vr not in LAZY_BULK_DATA_VRS:
+                    raise ValueError(
+                        f"Lazy bulk data retrieval is not supported for data "
+                        f"element '{self.tag}' with VR '{self.vr}' - only "
+                        "the VRs OB, OW and UN may use a lazily retrieved "
+                        "'BulkDataURI'"
+                    )
+
+                # The handler is not called here - retrieval is deferred
+                #   until the value is accessed or the dataset is written
+                return BulkDataReference(
+                    self.tag,
+                    self.vr,
+                    value,
+                    cast(BulkDataStreamHandlerType, self.bulk_data_element_handler),
                 )
 
             if self.bulk_data_element_handler is None:
@@ -301,6 +388,7 @@ class JsonDataElementConverter:
                     val[value_key],
                     value_key,
                     self.bulk_data_element_handler,
+                    lazy_bulk_data=self.lazy_bulk_data,
                 )
             ds.add(elem)
 
