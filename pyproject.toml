@@ -155,3 +155,8 @@ disable_error_code = ["method-assign", "ignore-without-code", "redundant-expr", 
 # Override unused ignores for that one file
 module = "pydicom.encoders.base"
 warn_unused_ignores = false
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

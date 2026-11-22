@@ -24,3 +24,22 @@ class BytesLengthException(Exception):
     """Exception that is raised for an unexpected number of bytes."""
 
     pass
+
+
+class DeflateError(ValueError):
+    """Exception raised when Deflated Explicit VR Little Endian data is invalid.
+
+    Raised when the raw DEFLATE stream cannot be decompressed, when it ends
+    prematurely (truncated data), or when it contains non-zero data after the
+    end of the stream.
+    """
+
+
+class DataSourceClosedError(OSError):
+    """Exception raised when reading from a released dataset data source.
+
+    Raised when a deferred element whose value has not been retrieved yet is
+    accessed after the :class:`~pydicom.dataset.Dataset` it belongs to has
+    been closed with :meth:`Dataset.close()<pydicom.dataset.Dataset.close>`.
+    """
+

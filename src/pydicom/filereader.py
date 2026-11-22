@@ -2,16 +2,15 @@
 """Read a dicom media file"""
 
 
-# Need zlib and io.BytesIO for deflate-compressed file
 import os
 from struct import Struct, unpack
 from typing import BinaryIO, Any, cast
 from collections.abc import Callable, MutableSequence, Iterator
-import zlib
 
 from pydicom import config
 from pydicom.charset import default_encoding, convert_encodings
 from pydicom.config import logger
+from pydicom.data_source import DeflateDataSource
 from pydicom.datadict import _dictionary_vr_fast
 from pydicom.dataelem import (
     DataElement,
@@ -20,8 +19,8 @@ from pydicom.dataelem import (
     empty_value_for_VR,
 )
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
-from pydicom.errors import InvalidDicomError
-from pydicom.filebase import ReadableBuffer, DicomBytesIO
+from pydicom.errors import DataSourceClosedError, InvalidDicomError
+from pydicom.filebase import ReadableBuffer
 from pydicom.fileutil import (
     read_undefined_length_value,
     path_from_pathlike,
@@ -835,6 +834,10 @@ def read_partial(
     """
     # Read File Meta Information
 
+    # The data source shared by the dataset and any deferred element reads
+    #   (only set for deflated datasets)
+    data_source: DeflateDataSource | None = None
+
     # Read preamble (if present)
     preamble = read_preamble(fileobj, force)
     # Read any File Meta Information group (0002,eeee) elements (if present)
@@ -893,17 +896,26 @@ def read_partial(
         # when written, the entire dataset following
         #     the file metadata was prepared the normal way,
         #     then "deflate" compression applied.
-        #  All that is needed here is to decompress and then
-        #     use as normal in a file-like object
-        zipped = fileobj.read()
-        name = getattr(fileobj, "name", None)
+        # The compressed stream is not seekable, so it is expanded lazily into
+        #   a seekable spool that all consumers (the initial read, deferred
+        #   element retrieval, pixel decoding) share. Only bounded chunks of
+        #   the compressed input are requested and only bounded chunks of
+        #   output are produced at a time.
+        def _reopen(path: str) -> BinaryIO:
+            # Re-open with the same factory the caller used (open() for a
+            #   path, gzip.open() for a gzipped file, etc.)
+            factory: Any = type(fileobj)
+            return cast(BinaryIO, factory(path, "rb"))
 
-        # -MAX_WBITS part is from comp.lang.python answer:
-        # groups.google.com/group/comp.lang.python/msg/e95b3b38a71e6799
-        unzipped = zlib.decompress(zipped, -zlib.MAX_WBITS)
-        buffer = DicomBytesIO(unzipped)
-        buffer.name = name
-        fileobj = cast(BinaryIO, buffer)  # a file-like object
+        name = getattr(fileobj, "name", None)
+        data_source = DeflateDataSource(
+            fileobj,
+            fileobj.tell(),
+            owns_stream=False,
+            reopen_path=name if isinstance(name, str) else None,
+            reopen_factory=_reopen if isinstance(name, str) else None,
+        )
+        fileobj = cast(BinaryIO, data_source.open_reader())
         is_implicit_VR = False
     elif transfer_syntax in pydicom.uid.PrivateTransferSyntaxes:
         # Replace with the registered UID as it has the encoding information
@@ -931,8 +943,15 @@ def read_partial(
         )
     except EOFError:
         if config.settings.reading_validation_mode == config.RAISE:
+            if data_source is not None:
+                data_source.close()
             raise
         # warning already logged in read_dataset
+    except BaseException:
+        # Don't leak the temporary resources created for a failed read
+        if data_source is not None:
+            data_source.close()
+        raise
 
     # Add the command set elements to the dataset (if any)
     if command_set:
@@ -946,6 +965,12 @@ def read_partial(
         is_implicit_VR,
         is_little_endian,
     )
+    ds._data_source = data_source
+    if data_source is not None:
+        reopen_path = getattr(fileobj, "reopen_path", None)
+        if reopen_path is None and isinstance(getattr(ds, "filename", None), str):
+            reopen_path = ds.filename
+        data_source.reopen_path = reopen_path
     # save the originally read transfer syntax properties in the dataset
     ds.set_original_encoding(is_implicit_VR, is_little_endian, dataset._character_set)
     return ds
@@ -1074,6 +1099,8 @@ def dcmread(
     stop_when = None
     if stop_before_pixels:
         stop_when = _at_pixel_data
+
+    dataset = None
     try:
         dataset = read_partial(
             fp,
@@ -1084,7 +1111,18 @@ def dcmread(
         )
     finally:
         if not caller_owns_file:
-            fp.close()
+            data_source = getattr(dataset, "_data_source", None)
+            if data_source is None:
+                fp.close()
+            else:
+                # The deflated data source may read from `fp` lazily, so it
+                #   takes ownership and will close it once no longer needed
+                data_source.take_ownership(fp)
+        elif dataset is not None:
+            data_source = getattr(dataset, "_data_source", None)
+            if data_source is not None:
+                # The caller keeps ownership of their stream
+                data_source._owns_stream = False
     # XXX need to store transfer syntax etc.
     return dataset
 
@@ -1102,7 +1140,7 @@ def data_element_offset_to_value(is_implicit_VR: bool, VR: str | None) -> int:
 
 def read_deferred_data_element(
     fileobj_type: Any,
-    filename_or_obj: PathType | BinaryIO,
+    filename_or_obj: Any,
     timestamp: float | None,
     raw_data_elem: RawDataElement,
 ) -> RawDataElement:
@@ -1118,9 +1156,11 @@ def read_deferred_data_element(
     ----------
     fileobj_type : type
         The type of the original file object.
-    filename_or_obj : str or file-like
-        The filename of the original file if one exists, or the file-like
-        object where the data element persists.
+    filename_or_obj : str or file-like or DeflateDataSource
+        The filename of the original file if one exists, the file-like
+        object where the data element persists, or the
+        :class:`~pydicom.data_source.DeflateDataSource` of a deflated
+        dataset.
     timestamp : float or None
         The time (as given by stat.st_mtime) the original file has been
         read, if not a file-like.
@@ -1148,23 +1188,36 @@ def read_deferred_data_element(
     if filename_or_obj is None:
         raise OSError("Deferred read -- original filename not stored. Cannot re-open")
 
-    # Check that the file is the same as when originally read
-    is_filename = isinstance(filename_or_obj, str)
-    if isinstance(filename_or_obj, str):
-        if not os.path.exists(filename_or_obj):
-            raise OSError(
-                f"Deferred read -- original file {filename_or_obj} is missing"
-            )
+    from pydicom.data_source import DeflateDataSource
 
-        if timestamp is not None:
-            statinfo = os.stat(filename_or_obj)
-            if statinfo.st_mtime != timestamp:
-                warn_and_log(
-                    "Deferred read warning -- file modification time has changed"
+    is_source = isinstance(filename_or_obj, DeflateDataSource)
+    is_filename = isinstance(filename_or_obj, str)
+    if is_source:
+        if filename_or_obj.closed:
+            raise DataSourceClosedError(
+                "Unable to retrieve the deferred value of "
+                f"{raw_data_elem.tag!r}: the dataset's data source has been "
+                "closed"
+            )
+        fp = filename_or_obj.open_reader()
+    else:
+        # Check that the file is the same as when originally read
+        if is_filename:
+            if not os.path.exists(filename_or_obj):
+                raise OSError(
+                    f"Deferred read -- original file {filename_or_obj} is missing"
                 )
 
-    # Open the file, position to the right place
-    fp = fileobj_type(filename_or_obj, "rb") if is_filename else filename_or_obj
+            if timestamp is not None:
+                statinfo = os.stat(filename_or_obj)
+                if statinfo.st_mtime != timestamp:
+                    warn_and_log(
+                        "Deferred read warning -- file modification time has changed"
+                    )
+
+        # Open the file, position to the right place
+        fp = fileobj_type(filename_or_obj, "rb") if is_filename else filename_or_obj
+
     is_implicit_VR = raw_data_elem.is_implicit_VR
     is_little_endian = raw_data_elem.is_little_endian
     offset = data_element_offset_to_value(is_implicit_VR, raw_data_elem.VR)
@@ -1174,12 +1227,15 @@ def read_deferred_data_element(
         fp, is_implicit_VR, is_little_endian, defer_size=None
     )
 
-    # Read the data element and check matches what was stored before
-    # The first element out of the iterator should be the same type as the
-    #   the deferred element == RawDataElement
-    elem = cast(RawDataElement, next(elem_gen))
-    if is_filename:
-        fp.close()
+    try:
+        # Read the data element and check matches what was stored before
+        # The first element out of the iterator should be the same type as the
+        #   the deferred element == RawDataElement
+        elem = cast(RawDataElement, next(elem_gen))
+    finally:
+        if is_filename or is_source:
+            fp.close()
+
     if elem.VR != raw_data_elem.VR:
         raise ValueError(
             f"Deferred read VR {elem.VR} does not match original {raw_data_elem.VR}"

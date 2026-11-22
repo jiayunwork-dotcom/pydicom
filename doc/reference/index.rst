@@ -19,6 +19,7 @@ This API reference guide details the functions, modules and objects included in
    charset
    config
    data
+   data_source
    datadict
    dataset
    elem

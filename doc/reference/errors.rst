@@ -9,3 +9,5 @@ Exceptions (:mod:`pydicom.errors`)
    :toctree: generated/
 
    InvalidDicomError
+   DeflateError
+   DataSourceClosedError

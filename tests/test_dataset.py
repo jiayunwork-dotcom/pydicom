@@ -30,6 +30,7 @@ from pydicom.data import get_testdata_file
 from pydicom.dataelem import DataElement, RawDataElement
 from pydicom.dataset import Dataset, FileDataset, validate_file_meta, FileMetaDataset
 from pydicom.encaps import encapsulate
+from pydicom.data_source import SpoolReader
 from pydicom.filebase import DicomBytesIO
 from pydicom.pixels.utils import get_image_pixel_ids
 from pydicom.sequence import Sequence
@@ -2507,11 +2508,11 @@ class TestFileDataset:
         assert ds.buffer is buffer
         assert ds.fileobj_type == io.BytesIO
 
-        # Deflated datasets get inflated to a DicomBytesIO() buffer
+        # Deflated datasets use a lazily expanded, seekable spool
         ds = dcmread(get_testdata_file("image_dfl.dcm"))
         assert ds.filename.endswith("image_dfl.dcm")
-        assert isinstance(ds.buffer, DicomBytesIO)
-        assert ds.fileobj_type == DicomBytesIO
+        assert isinstance(ds.buffer, SpoolReader)
+        assert ds.fileobj_type is SpoolReader
 
 
 class TestDatasetOverlayArray:

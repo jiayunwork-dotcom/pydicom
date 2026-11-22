@@ -19,3 +19,34 @@ Enhancements
   "BulkDataURI" by :meth:`~pydicom.dataset.Dataset.to_json` and
   :meth:`~pydicom.dataset.Dataset.to_json_dict`. Retrieval failures raise
   :class:`~pydicom.bulkdata.BulkDataError`.
+
+Fixes
+-----
+
+* Fixed reading *Deflated Explicit VR Little Endian* datasets with
+  :func:`~pydicom.pixels.pixel_array` and
+  :func:`~pydicom.pixels.iter_pixels` when the source is a path or file-like
+  object. Previously the pixel data functions used the compressed stream as if
+  it were a plain dataset, so no *Pixel Data* element was found. Such datasets
+  are now expanded lazily into a seekable spool shared by the dataset, deferred
+  element retrieval and the pixel decoders
+  (see :class:`~pydicom.data_source.DeflateDataSource`). Frame selection
+  supports out-of-order, repeated and interleaved iteration, and the
+  compressed input is only requested in bounded chunks.
+
+* Reading a *Deflated Explicit VR Little Endian* dataset with `defer_size`
+  no longer keeps the complete decompressed dataset in memory. Deferred values
+  remain retrievable, but the decompressed data no longer determines the
+  resident memory usage: small datasets stay in an in-memory spool and larger
+  ones roll over to a temporary file. Peak memory is bounded by the chunk
+  sizes and the spool's in-memory limit.
+
+* Added :meth:`Dataset.close()<pydicom.dataset.Dataset.close>` and
+  :attr:`Dataset.closed<pydicom.dataset.Dataset.closed>` for releasing the
+  resources used by a dataset's deferred data source. Closing is idempotent;
+  already retrieved values are unaffected and retrieving an unmaterialised
+  value afterwards raises :class:`~pydicom.errors.DataSourceClosedError`.
+  Datasets read from a path release the source when used as a context manager.
+
+* Truncated or corrupt *Deflated Explicit VR Little Endian* data now raises
+  :class:`~pydicom.errors.DeflateError` instead of being silently accepted.

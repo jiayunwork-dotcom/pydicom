@@ -64,6 +64,7 @@ from pydicom.datadict import (
     get_private_entry,
 )
 from pydicom.dataelem import DataElement, convert_raw_data_element, RawDataElement
+from pydicom.errors import DataSourceClosedError
 from pydicom.filebase import ReadableBuffer, WriteableBuffer
 from pydicom.fileutil import path_from_pathlike, PathType
 from pydicom.misc import warn_and_log
@@ -423,6 +424,12 @@ class Dataset:
         self._pixel_array_opts: dict[str, Any] = {"use_pdh": False}
         self._pixel_id: dict[str, int] = {}
 
+        # Set by the reader for deflated datasets: the shared, replayable data
+        #   source used for deferred element retrieval and pixel decoding.
+        #   It's defined here (as well as in FileDataset) so that any Dataset
+        #   instance can be queried without a hasattr() check.
+        self._data_source: Any = None
+
         self.file_meta: FileMetaDataset
 
         # Used after reading an implicit dataset to help determine the VR of
@@ -443,6 +450,8 @@ class Dataset:
         exc_tb: TracebackType | None,
     ) -> bool | None:
         """Method invoked on exit from a with statement."""
+        if isinstance(self, FileDataset):
+            self.close()
         # Returning anything other than True will re-raise any exceptions
         return None
 
@@ -1056,17 +1065,32 @@ class Dataset:
             if elem.value is None and elem.length != 0:
                 from pydicom.filereader import read_deferred_data_element
 
-                src = self.filename or self.buffer
-                if (
-                    self.filename
-                    and self.buffer
-                    and not getattr(self.buffer, "closed", False)
-                ):
-                    src = self.buffer
+                if self._data_source is not None:
+                    # Deferred values of deflated datasets are read from the
+                    #   same data source (and therefore the same decompressed
+                    #   spool) that the initial read used
+                    if self._data_source.closed:
+                        raise DataSourceClosedError(
+                            "Unable to retrieve the deferred value of "
+                            f"{elem.tag!r}: the dataset's data source has been "
+                            "closed (see Dataset.close())"
+                        )
+                    src = self._data_source
+                    elem = read_deferred_data_element(
+                        self.fileobj_type, src, self.timestamp, elem
+                    )
+                else:
+                    src = self.filename or self.buffer
+                    if (
+                        self.filename
+                        and self.buffer
+                        and not getattr(self.buffer, "closed", False)
+                    ):
+                        src = self.buffer
 
-                elem = read_deferred_data_element(
-                    self.fileobj_type, src, self.timestamp, elem
-                )
+                    elem = read_deferred_data_element(
+                        self.fileobj_type, src, self.timestamp, elem
+                    )
 
             if tag != BaseTag(0x00080005):
                 character_set = self.original_character_set or self._character_set
@@ -3391,6 +3415,14 @@ class FileDataset(Dataset):
     timestamp : float | None
         The modification time of the file the :class:`FileDataset` was read
         from, ``None`` if the modification time is not available.
+
+    Notes
+    -----
+    Datasets read from a *Deflated Explicit VR Little Endian* file use a
+    :class:`~pydicom.data_source.DeflateDataSource` (see
+    :attr:`data_source`) to retrieve deferred values without expanding the
+    whole dataset into memory. Use :meth:`close` (or a ``with`` statement) to
+    release its temporary resources once done.
     """
 
     def __init__(
@@ -3469,6 +3501,51 @@ class FileDataset(Dataset):
         if self.filename and os.path.exists(self.filename):
             self.timestamp = os.stat(self.filename).st_mtime
 
+        # Set by the reader for deflated datasets: the shared, replayable data
+        #   source used for deferred element retrieval and pixel decoding
+        self._data_source: Any = None
+
+    @property
+    def data_source(self) -> Any:
+        """Return the dataset's deferred data source, or ``None``.
+
+        Datasets read from a *Deflated Explicit VR Little Endian* file may use
+        a :class:`~pydicom.data_source.DeflateDataSource` to provide access to
+        deferred element values and pixel data without expanding the whole
+        dataset into memory. For all other datasets this is ``None``.
+
+        The source is owned by the dataset. See
+        :meth:`close` and :func:`~pydicom.filereader.dcmread` for its
+        lifetime.
+        """
+        return self._data_source
+
+    def close(self) -> None:
+        """Close and release the dataset's data source (if any).
+
+        For datasets read from a path, this releases the temporary resources
+        used to lazily expand a *Deflated Explicit VR Little Endian* dataset.
+        It is idempotent and safe to call on datasets without a data source.
+
+        Values that have already been retrieved (materialised) are unaffected.
+        Accessing a deferred element whose value has not been retrieved yet
+        raises :class:`~pydicom.errors.DataSourceClosedError` after closing.
+
+        The dataset remains usable for everything except retrieving values
+        that still need the data source (including pixel decoding from the
+        dataset itself).
+        """
+        if (source := self._data_source) is not None:
+            source.close()
+
+    @property
+    def closed(self) -> bool:
+        """Return ``True`` if the dataset's data source has been released.
+
+        Always ``False`` for datasets without a data source.
+        """
+        return self._data_source is not None and self._data_source.closed
+
     def __deepcopy__(self, memo: dict[int, Any]) -> "FileDataset":
         """Return a deep copy of the file dataset.
 
@@ -3484,6 +3561,14 @@ class FileDataset(Dataset):
         memo[id(self)] = result
         for k, v in self.__dict__.items():
             if k == "buffer":
+                from pydicom.data_source import SpoolReader
+
+                if isinstance(v, SpoolReader):
+                    # Replaced after the loop with a reader of the copied
+                    #   data source (a reader can't be pickled)
+                    setattr(result, k, None)
+                    continue
+
                 try:
                     setattr(result, k, copy.deepcopy(v, memo))
                 except Exception as exc:
@@ -3494,8 +3579,22 @@ class FileDataset(Dataset):
                         "copied object"
                     )
                     setattr(result, k, copy.deepcopy(None, memo))
+            elif k == "_data_source":
+                # The source's readers can't be pickled, but the source itself
+                #   exposes a chunked copy so deferred values still work. A
+                #   deflated dataset's buffer is a corresponding reader, which
+                #   is replaced by one for the copied source below.
+                setattr(result, k, v.clone() if v is not None else None)
             else:
                 setattr(result, k, copy.deepcopy(v, memo))
+
+        # Give the copy its own reader of its own data source
+        if result._data_source is not None:
+            from pydicom.data_source import SpoolReader
+
+            if isinstance(self.buffer, SpoolReader):
+                result.buffer = result._data_source.open_reader()
+                result.fileobj_type = SpoolReader
 
         return result
 

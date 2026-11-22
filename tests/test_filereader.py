@@ -27,6 +27,7 @@ from pydicom.filereader import (
 )
 from pydicom.dataelem import DataElement, convert_raw_data_element
 from pydicom.errors import InvalidDicomError
+from pydicom.data_source import SpoolReader
 from pydicom.filebase import DicomBytesIO
 from pydicom.multival import MultiValue
 from pydicom.sequence import Sequence
@@ -285,7 +286,8 @@ class TestReader:
         # If we can read anything else, the decompression must have been ok.
         ds = dcmread(deflate_name)
         assert "WSD" == ds.ConversionType
-        assert isinstance(ds.buffer, DicomBytesIO)
+        # Deflated datasets use a lazily expanded, seekable spool
+        assert isinstance(ds.buffer, SpoolReader)
         assert ds.filename == deflate_name
 
     def test_sequence_with_implicit_vr(self):
@@ -1691,7 +1693,7 @@ class TestDeferredRead:
         """Deferred values work with file-like objects."""
         path = get_testdata_file("image_dfl.dcm")
         ds = pydicom.dcmread(path, defer_size=1024)
-        assert isinstance(ds.buffer, DicomBytesIO)
+        assert isinstance(ds.buffer, SpoolReader)
         assert 262144 == len(ds.PixelData)
 
 

@@ -4,6 +4,7 @@
 from collections.abc import Iterable, Iterator, ByteString
 import importlib
 import logging
+import os
 from pathlib import Path
 from struct import unpack, Struct
 from sys import byteorder
@@ -88,8 +89,11 @@ _UNPACK_SHORT = Struct(">H").unpack
 
 
 def _array_common(
-    f: BinaryIO, specific_tags: list[BaseTag | int], **kwargs: Any
-) -> tuple["Dataset", dict[str, Any]]:
+    f: BinaryIO,
+    specific_tags: list[BaseTag | int],
+    reopen_path: str | None = None,
+    **kwargs: Any,
+) -> tuple["Dataset", dict[str, Any], Any, Any]:
     """Return a dataset from `f` and a corresponding decoding options dict.
 
     Parameters
@@ -100,18 +104,29 @@ def _array_common(
     specific_tags : list[BaseTag | int]
         A list of additional tags to be read from the dataset and possibly
         returned via the `ds_out` dataset.
+    reopen_path : str, optional
+        If `f` was opened from this path by the caller, the path to use to
+        re-open the compressed input if `f` is closed before the data source
+        has finished expanding.
     kwargs : dict[str, Any]
         Required and optional arguments for the pixel data decoding functions.
 
     Returns
     -------
-    tuple[Dataset, dict[str, Any]]
+    tuple[Dataset, dict[str, Any], BinaryIO, DeflateDataSource | None]
 
         * A dataset containing the group 0x0028 elements, the extended offset
           elements (if any) and elements from `specific_tags`.
         * The required and optional arguments for the pixel data decoding
           functions.
+        * The file-like positioned at the start of the pixel data value. For
+          a *Deflated Explicit VR Little Endian* dataset this is a new reader
+          of the dataset's decompressed data source rather than `f`; the
+          caller is responsible for closing both the reader and the data
+          source. For other datasets it is `f` itself.
+        * The data source providing the reader (``None`` if not deflated).
     """
+    from pydicom.data_source import DeflateDataSource
     from pydicom.filereader import (
         read_preamble,
         _read_file_meta_info,
@@ -136,20 +151,41 @@ def _array_common(
 
     tsyntax = UID(tsyntax)
 
-    # Get the *Image Pixel* module 0028 elements, any extended offsets and
-    #   any other tags wanted by the user
-    ds = read_dataset(
-        f,
-        is_implicit_VR=tsyntax.is_implicit_VR,
-        is_little_endian=tsyntax.is_little_endian,
-        stop_when=_at_pixel_data,
-        specific_tags=specific_tags,
-    )
-    ds.file_meta = file_meta
+    stream: BinaryIO = f
+    data_source: DeflateDataSource | None = None
+    if tsyntax.is_deflated:
+        # The compressed stream is expanded lazily into a spool, in bounded
+        #   chunks, and the returned reader is independently positioned so
+        #   that later frame reads don't depend on `f`
+        data_source = DeflateDataSource(
+            f, f.tell(), owns_stream=False, reopen_path=reopen_path
+        )
+        stream = cast(BinaryIO, data_source.open_reader())
 
-    opts = as_pixel_options(ds, **kwargs)
-    opts["transfer_syntax_uid"] = tsyntax
+    try:
+        ds = read_dataset(
+            stream,
+            is_implicit_VR=tsyntax.is_implicit_VR,
+            is_little_endian=tsyntax.is_little_endian,
+            stop_when=_at_pixel_data,
+            specific_tags=specific_tags,
+        )
+        ds.file_meta = file_meta
+        opts = as_pixel_options(ds, **kwargs)
+        opts["transfer_syntax_uid"] = tsyntax
+        _array_common_pixel_header(stream, opts, tsyntax)
+    except BaseException:
+        if data_source is not None:
+            data_source.close()
+        raise
 
+    return ds, opts, stream, data_source
+
+
+def _array_common_pixel_header(
+    f: BinaryIO, opts: dict[str, Any], tsyntax: "UID"
+) -> None:
+    """Parse the pixel data element header from `f`, leaving it at the value."""
     # We are either at the start of the element tag for a pixel data
     #   element or at EOF because there were none
     try:
@@ -163,7 +199,6 @@ def _array_common(
 
     endianness = "><"[tsyntax.is_little_endian]
     if tsyntax.is_implicit_VR:
-        vr = None
         group, elem, length = unpack(f"{endianness}HHL", data)
     else:
         # Is always 32-bit extended length for pixel data VRs
@@ -173,8 +208,6 @@ def _array_common(
 
     # We should now be positioned at the start of the pixel data value
     opts["pixel_keyword"] = _PIXEL_KEYWORDS[(group, elem)]
-
-    return ds, opts
 
 
 def as_pixel_options(ds: "Dataset", **kwargs: Any) -> dict[str, Any]:
@@ -1150,21 +1183,31 @@ def iter_pixels(
         return
 
     f: BinaryIO
+    reopen_path: str | None = None
     if not hasattr(src, "read"):
         path = Path(src).resolve(strict=True)
         f = path.open("rb")
+        reopen_path = str(path)
     else:
         f = cast(BinaryIO, src)
         file_offset = f.tell()
         f.seek(0)
+        name = getattr(f, "name", None)
+        if isinstance(name, str) and os.path.isfile(name):
+            reopen_path = name
 
     tags = _DEFAULT_TAGS
     if ds_out is not None:
         tags = set(specific_tags) if specific_tags else set()
         tags = tags | _GROUP_0028 | {0x7FE00001, 0x7FE00002}
 
+    completed = False
+    stream: BinaryIO = f
+    data_source: Any = None
     try:
-        ds, opts = _array_common(f, list(tags), **kwargs)
+        ds, opts, stream, data_source = _array_common(
+            f, list(tags), reopen_path, **kwargs
+        )
 
         if isinstance(ds_out, Dataset):
             ds_out.file_meta = ds.file_meta
@@ -1182,7 +1225,7 @@ def iter_pixels(
             )
 
         iterator = decoder.iter_array(
-            f,
+            stream,
             indices=indices,
             validate=True,
             raw=raw,
@@ -1192,12 +1235,30 @@ def iter_pixels(
         for arr, _ in iterator:
             yield arr
 
+        completed = True
+
     finally:
-        # Close the open file only if we were the ones that opened it
-        if not hasattr(src, "read"):
-            f.close()
-        else:
-            f.seek(file_offset)
+        # A consumer that runs to completion must confirm that the compressed
+        #   stream really did end (so truncated input can't masquerade as a
+        #   successful read of the frames yielded so far). An early close()
+        #   only ends this consumption and makes no such claim.
+        try:
+            if completed and data_source is not None:
+                data_source.verify_complete()
+        finally:
+            # Close the data source reader and release the decompressed spool
+            #   (a deflated dataset uses its own reader of the spool)
+            try:
+                if data_source is not None and stream is not f:
+                    stream.close()
+                if data_source is not None:
+                    data_source.close()
+            finally:
+                # Close the open file only if we were the ones that opened it
+                if not hasattr(src, "read"):
+                    f.close()
+                else:
+                    f.seek(file_offset)
 
 
 def pack_bits(arr: "np.ndarray", pad: bool = True) -> bytes:
@@ -1437,21 +1498,30 @@ def pixel_array(
         )[0]
 
     f: BinaryIO
+    reopen_path: str | None = None
     if not hasattr(src, "read"):
         path = Path(src).resolve(strict=True)
         f = path.open("rb")
+        reopen_path = str(path)
     else:
         f = cast(BinaryIO, src)
         file_offset = f.tell()
         f.seek(0)
+        name = getattr(f, "name", None)
+        if isinstance(name, str) and os.path.isfile(name):
+            reopen_path = name
 
     tags = _DEFAULT_TAGS
     if ds_out is not None:
         tags = set(specific_tags) if specific_tags else set()
         tags = tags | _GROUP_0028 | {0x7FE00001, 0x7FE00002}
 
+    stream: BinaryIO = f
+    data_source: Any = None
     try:
-        ds, opts = _array_common(f, list(tags), **kwargs)
+        ds, opts, stream, data_source = _array_common(
+            f, list(tags), reopen_path, **kwargs
+        )
         tsyntax = opts["transfer_syntax_uid"]
 
         try:
@@ -1463,14 +1533,26 @@ def pixel_array(
             )
 
         arr, _ = decoder.as_array(
-            f,
+            stream,
             index=index,
             validate=True,
             raw=raw,
             decoding_plugin=decoding_plugin,
             **opts,  # type: ignore[arg-type]
         )
+
+        # Confirm the compressed stream is complete (a truncated stream must
+        #   not look like a successful read)
+        if data_source is not None:
+            data_source.verify_complete()
     finally:
+        # Close the data source reader and release the decompressed spool (a
+        #   deflated dataset uses its own reader of the spool)
+        if stream is not f:
+            stream.close()
+        if data_source is not None:
+            data_source.close()
+
         # Close the open file only if we were the ones that opened it
         if not hasattr(src, "read"):
             f.close()
