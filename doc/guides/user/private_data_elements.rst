@@ -163,3 +163,98 @@ you always have to provide the private creator to define a new private tag.
 
 An example of how to use :func:`~pydicom.datadict.add_private_dict_entries` can
 be found in :ref:`this code snippet <sphx_glr_auto_examples_metadata_processing_plot_add_dict_entries.py>`.
+
+Per-read private dictionaries
+-----------------------------
+
+:func:`~pydicom.datadict.add_private_dict_entries` modifies a process-global
+dictionary, so it cannot represent two sources that reuse the same private
+creator name with different meanings - for example two vendors that both use
+``"ACME"`` where offset ``0x01`` is a **UL** in one archive and a **US** in
+another.  For these cases :func:`~pydicom.filereader.dcmread` accepts a
+keyword-only ``private_dictionary`` argument that binds a private dictionary
+to that single read only::
+
+    >>> private_dictionary = {
+    ...     "ACME": {
+    ...         (0x0041, 0x01): ("UL", "1", "ACME Unsigned Long", ""),
+    ...     }
+    ... }
+    >>> ds = dcmread("acme.dcm", private_dictionary=private_dictionary)
+    >>> ds[0x00411001].VR
+    'UL'
+
+The mapping is ``{creator: {(group, offset): (VR, VM, description, retired)}}``
+where:
+
+* the creator must be a non-empty :class:`str`,
+* the group must be an odd :class:`int` from ``0x0001`` to ``0xFFFF``
+  (``bool`` is rejected),
+* the offset must be an :class:`int` from ``0`` to ``255`` (``bool`` is
+  rejected),
+* the VR must be a single definite DICOM VR such as ``"UL"`` or ``"LO"`` -
+  ambiguous VRs like ``"US or SS"`` are not allowed,
+* the VM must follow DICOM notation, e.g. ``"1"``, ``"1-n"`` or ``"2-2n"``,
+* the description and retired flag must be strings,
+* the whole mapping may be empty (it is then ignored) and must not contain
+  callbacks or other callable objects.
+
+Any invalid configuration raises :class:`ValueError` before the first byte of
+the input is read.
+
+Overlay priority and standard tags
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A matching entry in ``private_dictionary`` takes precedence over pydicom's
+built-in private dictionary.  Private tags that the overlay does not define
+continue to be resolved through the built-in dictionary, and standard
+(non-private) tags are never affected.  The overlay is never written to the
+process-global private dictionary, so different threads may read different
+sources with different definitions concurrently without any global lock.
+
+For explicit VR transfer syntaxes the VR stored in the file always wins; the
+overlay only supplies the description.  For implicit VR little endian files
+the overlay VR participates in the actual byte parsing, including deciding
+whether an undefined-length private element is a sequence.
+
+Frozen interpretation, copies and pickling
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The interpretation is frozen when the read starts.  Mutating the caller's
+mapping afterwards, registering global private entries, or reading another
+source does not change any element already returned, including its
+:attr:`~pydicom.dataelem.DataElement.VR`,
+:attr:`~pydicom.dataelem.DataElement.name` and
+:attr:`~pydicom.dataelem.DataElement.repval`.  This also holds for elements
+inside sequences (which may define their own private creators), for values
+materialised later through ``defer_size`` and for a detached
+:class:`~pydicom.dataelem.DataElement` taken from the dataset.
+
+:meth:`~pydicom.dataset.Dataset.copy`, :func:`copy.deepcopy` and
+:mod:`pickle` preserve the bound interpretation; a pickled dataset reloaded in
+another process keeps its VR and description without any global registration.
+Whether the deferred source file or buffer is still readable later remains the
+caller's responsibility, as for ordinary deferred reads.
+
+All datasets of one read - including every nested sequence item - share one
+immutable binding object, so the extra memory is the size of the validated
+overlay (O(K) for K entries) rather than a per-dataset copy (no O(K*N)
+growth for N parsed datasets).
+
+With ``specific_tags``
+^^^^^^^^^^^^^^^^^^^^^^
+
+Private creator elements are still scanned when ``specific_tags`` is used, so a
+selected private element can be interpreted even though its creator is not in
+the returned tag set.  The creator elements themselves are not added to the
+result dataset.
+
+Writing back
+^^^^^^^^^^^^
+
+No configuration entry is needed to write a dataset read this way.  Writing an
+interpreted dataset to explicit VR little endian and re-reading it *without*
+any overlay restores the private values and the sequence hierarchy, because the
+resolved VR is written into the file.  Custom descriptions are not persisted in
+the DICOM file and no configuration hook is added for newly constructed
+:class:`~pydicom.dataset.Dataset` objects.

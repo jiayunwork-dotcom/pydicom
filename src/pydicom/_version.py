@@ -3,9 +3,12 @@
 import re
 from typing import cast
 from re import Match
-from importlib.metadata import version
+from importlib.metadata import version, PackageNotFoundError
 
-__version__: str = version("pydicom")
+try:
+    __version__: str = version("pydicom")
+except PackageNotFoundError:  # e.g. running from an isolated source tree
+    __version__ = "0.0.0"
 
 result = cast(Match[str], re.match(r"(\d+\.\d+\.\d+).*", __version__))
 __version_info__ = tuple(result.group(1).split("."))

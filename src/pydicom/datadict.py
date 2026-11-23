@@ -1,12 +1,17 @@
 # Copyright 2008-2018 pydicom authors. See LICENSE file for details.
 """Access dicom dictionary information"""
 
+import re
+from contextvars import ContextVar
+from collections.abc import Mapping
+
 # the actual dict of {tag: (VR, VM, name, is_retired, keyword), ...}
 # those with tags like "(50xx,0005)"
 from pydicom._dicom_dict import DicomDictionary, RepeatersDictionary
 from pydicom.misc import warn_and_log
 from pydicom._private_dict import private_dictionaries
 from pydicom.tag import Tag, BaseTag, TagType
+from pydicom.valuerep import VR as VR_
 
 
 # Generate mask dict for checking repeating groups etc.
@@ -654,3 +659,273 @@ def private_dictionary_description(tag: TagType, private_creator: str) -> str:
         or if the private creator is not valid.
     """
     return get_private_entry(tag, private_creator)[2]
+
+
+# ---------------------------------------------------------------------------
+# Per-read private dictionary bindings
+#
+# A PrivateDictionaryBinding is an immutable, per-read overlay of the global
+# private dictionary.  Bindings are *not* merged into ``private_dictionaries``:
+# the same process (and even the same thread) may use different definitions
+# for the same private creator, while datasets returned by an earlier read
+# keep interpreting their private elements through the binding they were read
+# with.  A single binding object is shared by every dataset of one read
+# (including all nested sequence items), so the additional storage is O(K)
+# for the whole read instead of O(K*N) for N parsed datasets.
+# ---------------------------------------------------------------------------
+
+# The single, definite VRs of DICOM Standard Part 5, Table 6.2-1.
+# Ambiguous VRs such as "US or SS" are deliberately not accepted.
+_DEFINITE_VRS = frozenset(str(vr) for vr in VR_ if "or" not in str(vr))
+
+# DICOM VM notation (PS3.5, 6.4): a positive integer multiplicity, an open or
+# closed range of positive multiplicities, or an even range such as "2-2n".
+_VM_REGEX = re.compile(r"^[1-9]\d*(?:-(?:[1-9]\d*n?|n))?$")
+
+# Type of a validated private dictionary entry: (VR, VM, description, retired)
+PrivateDictEntry = tuple[str, str, str, str]
+
+
+def _validate_private_dictionary(
+    private_dictionary: Mapping[str, Mapping[tuple[int, int], tuple]],
+) -> dict[str, dict[tuple[int, int], PrivateDictEntry]]:
+    """Validate a caller supplied `private_dictionary` and return a frozen copy.
+
+    The copy is built from plain builtin containers (``dict`` and ``tuple``),
+    so it does not keep any caller object - including callables - alive and is
+    safe to share between threads and to pickle.
+
+    Raises
+    ------
+    ValueError
+        If any part of the configuration is invalid.  Everything that is wrong
+        with the configuration is reported as :class:`ValueError`, never as
+        :class:`TypeError` or :class:`KeyError`.
+    """
+    if not isinstance(private_dictionary, Mapping):
+        raise ValueError(
+            "'private_dictionary' must be a mapping of private creator names "
+            "to private dictionary mappings"
+        )
+
+    frozen: dict[str, dict[tuple[int, int], PrivateDictEntry]] = {}
+    for creator, entries in private_dictionary.items():
+        # bool is a subclass of int, so reject it explicitly
+        if not isinstance(creator, str) or isinstance(creator, bool) or not creator:
+            raise ValueError(
+                "Private creator names must be non-empty strings, got "
+                f"{creator!r} of type {type(creator).__name__}"
+            )
+
+        if not isinstance(entries, Mapping):
+            raise ValueError(
+                f"The entries for private creator {creator!r} must be a mapping "
+                "of (group, offset) keys to (VR, VM, description, retired) "
+                f"tuples, got {type(entries).__name__}"
+            )
+
+        creator_dict: dict[tuple[int, int], PrivateDictEntry] = {}
+        for key, entry in entries.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or isinstance(key, bool)
+                or not all(
+                    isinstance(part, int) and not isinstance(part, bool)
+                    for part in key
+                )
+            ):
+                raise ValueError(
+                    f"Private dictionary keys for creator {creator!r} must be "
+                    f"(group, offset) integer tuples, got {key!r}"
+                )
+
+            group, offset = key
+            if not 0x0001 <= group <= 0xFFFF or group % 2 == 0:
+                raise ValueError(
+                    f"Private group for creator {creator!r} and key {key!r} must "
+                    "be an odd integer between 0x0001 and 0xFFFF, got "
+                    f"{group:#06x}"
+                )
+
+            if not 0 <= offset <= 255:
+                raise ValueError(
+                    f"Private element offset for creator {creator!r} and key "
+                    f"{key!r} must be an integer between 0 and 255, got {offset}"
+                )
+
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 4
+                or any(callable(part) for part in entry)
+            ):
+                raise ValueError(
+                    f"Private dictionary entry for {creator!r} / {key!r} must "
+                    "be a (VR, VM, description, retired) tuple without callables"
+                )
+
+            vr, vm, description, retired = entry
+            if not isinstance(vr, str) or isinstance(vr, bool) or vr not in _DEFINITE_VRS:
+                raise ValueError(
+                    f"Invalid VR {vr!r} for {creator!r} / {key!r}: must be a "
+                    "single definite DICOM VR (e.g. 'UL', 'US' or 'LO'); "
+                    "ambiguous VRs such as 'US or SS' are not allowed"
+                )
+
+            if not isinstance(vm, str) or isinstance(vm, bool) or not _VM_REGEX.match(vm):
+                raise ValueError(
+                    f"Invalid VM {vm!r} for {creator!r} / {key!r}: must follow "
+                    "DICOM VM notation such as '1', '1-n', '2-2n' or '1-3'"
+                )
+
+            if not isinstance(description, str) or isinstance(description, bool):
+                raise ValueError(
+                    f"Invalid description for {creator!r} / {key!r}: must be a "
+                    f"string, got {type(description).__name__}"
+                )
+
+            if not isinstance(retired, str) or isinstance(retired, bool):
+                raise ValueError(
+                    f"Invalid retired flag for {creator!r} / {key!r}: must be a "
+                    f"string, got {type(retired).__name__}"
+                )
+
+            creator_dict[(group, offset)] = (vr, vm, description, retired)
+
+        frozen[creator] = creator_dict
+
+    return frozen
+
+
+class PrivateDictionaryBinding:
+    """An immutable private dictionary overlay bound to a single read.
+
+    Instances are created by :func:`make_private_dictionary_binding` and shared
+    by every :class:`~pydicom.dataset.Dataset` (and nested sequence item
+    dataset) produced by the corresponding
+    :func:`~pydicom.filereader.dcmread` call.
+
+    The overlay is checked first.  Tags it does not define continue to be
+    resolved through the built-in global private dictionary, and standard
+    (non-private) tags are unaffected.  The object is frozen at read start:
+    later changes to the caller mapping, to the global private dictionary or
+    to private creator registrations do not alter any interpretation handed
+    out through this binding.
+
+    Attributes
+    ----------
+    overlay : dict
+        The validated, frozen mapping of private creator name to a mapping of
+        ``(group, offset)`` to ``(VR, VM, description, retired)`` entries.
+    """
+
+    __slots__ = ("overlay",)
+
+    def __init__(
+        self, overlay: dict[str, dict[tuple[int, int], PrivateDictEntry]]
+    ) -> None:
+        self.overlay = overlay
+
+    def lookup(
+        self, tag: BaseTag | int, private_creator: str
+    ) -> PrivateDictEntry | None:
+        """Return the overlay entry for `tag`, or ``None`` if not defined.
+
+        Private dictionary entries are block agnostic (see PS3.5 7.8.1): only
+        the private group and the low byte of the element number are used.
+        """
+        if not isinstance(tag, BaseTag):
+            tag = Tag(tag)
+
+        creator_entries = self.overlay.get(private_creator)
+        if creator_entries is None:
+            return None
+
+        return creator_entries.get((tag.group, tag.element & 0xFF))
+
+    def get_private_entry(
+        self, tag: BaseTag | int, private_creator: str
+    ) -> PrivateDictEntry | None:
+        """Return the overlay entry, falling back to the built-in dictionary.
+
+        ``None`` is returned if neither the overlay nor the built-in private
+        dictionary define `tag` for `private_creator`.
+        """
+        entry = self.lookup(tag, private_creator)
+        if entry is not None:
+            return entry
+
+        try:
+            return get_private_entry(tag, private_creator)
+        except KeyError:
+            return None
+
+    def private_VR(self, tag: BaseTag | int, private_creator: str) -> str | None:
+        """Return the VR for `tag`, or ``None`` if nothing defines it."""
+        entry = self.get_private_entry(tag, private_creator)
+        return entry[0] if entry is not None else None
+
+    def private_description(
+        self, tag: BaseTag | int, private_creator: str
+    ) -> str | None:
+        """Return the description for `tag`, or ``None`` if undefined."""
+        entry = self.get_private_entry(tag, private_creator)
+        return entry[2] if entry is not None else None
+
+
+def make_private_dictionary_binding(
+    private_dictionary: Mapping[str, Mapping[tuple[int, int], tuple]] | None,
+) -> PrivateDictionaryBinding | None:
+    """Validate `private_dictionary` and return the binding for one read.
+
+    Parameters
+    ----------
+    private_dictionary : mapping, optional
+        A mapping of private creator name to mappings of ``(group, offset)``
+        keys to ``(VR, VM, description, retired)`` tuples, as accepted by
+        :func:`~pydicom.filereader.dcmread`.  ``None`` or an empty mapping
+        result in ``None``, i.e. a read without a private dictionary overlay.
+
+    Returns
+    -------
+    PrivateDictionaryBinding or None
+        The immutable binding for the read, or ``None`` if no overlay was
+        supplied.
+
+    Raises
+    ------
+    ValueError
+        If any part of `private_dictionary` is invalid.
+    """
+    if private_dictionary is None:
+        return None
+
+    try:
+        frozen = _validate_private_dictionary(private_dictionary)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # A malformed configuration must fail uniformly as ValueError, never
+        # leak a container type error from the caller's objects
+        raise ValueError(f"Invalid private_dictionary configuration: {exc}") from exc
+
+    if not frozen:
+        return None
+
+    return PrivateDictionaryBinding(frozen)
+
+
+# The binding of the dataset currently being parsed or converted.  Set for the
+# duration of a read and of every raw element conversion triggered through a
+# bound dataset.  Using a ContextVar (instead of a plain module global or a
+# lock) lets threads use different bindings concurrently without serialising
+# reads, and lets nested sequence parsing inherit the binding without passing
+# a copy of the whole configuration through every sequence item.
+_active_private_binding: ContextVar[PrivateDictionaryBinding | None] = ContextVar(
+    "pydicom_active_private_binding", default=None
+)
+
+
+def get_active_private_binding() -> PrivateDictionaryBinding | None:
+    """Return the private dictionary binding of the current read context."""
+    return _active_private_binding.get()

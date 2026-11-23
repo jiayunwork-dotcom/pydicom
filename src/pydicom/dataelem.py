@@ -29,6 +29,7 @@ from pydicom.datadict import (
     private_dictionary_description,
     dictionary_VR,
     repeater_has_tag,
+    get_active_private_binding,
 )
 from pydicom.hooks import hooks
 from pydicom.jsonrep import JsonDataElementConverter, BulkDataType
@@ -246,6 +247,10 @@ class DataElement:
         self.file_tell = file_value_tell
         self.is_undefined_length: bool = is_undefined_length
         self.private_creator: str | None = None
+        # When read through a private dictionary binding, the resolved
+        # private description is stored here so that the element name stays
+        # fixed even if the global private dictionary changes later.
+        self._private_name_override: str | None = None
 
     def validate(self, value: Any) -> None:
         """Validate the current value against the DICOM standard.
@@ -870,6 +875,11 @@ class DataElement:
             * Otherwise returns an empty string ``''``.
         """
         if self.tag.is_private:
+            if self._private_name_override is not None:
+                if self._private_name_override == "Private tag data":
+                    # snapshot of the default name for an unmatched private tag
+                    return "Private tag data"
+                return f"[{self._private_name_override}]"
             if self.private_creator:
                 try:
                     # If we have the name from the private dictionary, use it,
@@ -1022,7 +1032,7 @@ def convert_raw_data_element(
         hooks.raw_element_vr(raw, data, encoding=encoding, ds=ds)
         hooks.raw_element_value(raw, data, encoding=encoding, ds=ds)
 
-    return DataElement(
+    element = DataElement(
         raw.tag,
         data["VR"],
         data["value"],
@@ -1030,6 +1040,42 @@ def convert_raw_data_element(
         raw.length == 0xFFFFFFFF,
         already_converted=True,
     )
+
+    # Freeze the private interpretation of this element at conversion time.
+    # The VR has just been resolved (overlay first, then the global dictionary)
+    # by raw_element_vr, and the description is snapshotted here: subsequent
+    # global private dictionary registrations or caller mapping changes must
+    # not change the name of an element that has already been interpreted.
+    raw_tag = raw.tag if isinstance(raw.tag, BaseTag) else Tag(raw.tag)
+    if ds is not None and raw_tag.is_private and not raw_tag.is_private_creator:
+        creator = None
+        if raw_tag.element & 0xFF00:
+            creator_tag = BaseTag(raw_tag.group << 16 | (raw_tag.element >> 8))
+            creator_elem = ds._dict.get(creator_tag)
+            if creator_elem is not None:
+                creator = getattr(creator_elem, "value", None)
+            else:
+                creator = ds._private_creator_map.get(int(creator_tag))
+
+        if creator:
+            if isinstance(creator, str):
+                creator = creator.rstrip()
+            elif isinstance(creator, bytes):
+                creator = creator.rstrip(b" \x00").decode(
+                    "latin-1", errors="replace"
+                )
+            element.private_creator = creator
+            binding = get_active_private_binding()
+            if binding is not None:
+                # Freeze the description at conversion time. If neither the
+                # overlay nor the built-in dictionary define the tag, the
+                # default "Private tag data" name is snapshotted as well.
+                element._private_name_override = (
+                    binding.private_description(raw_tag, creator)
+                    or "Private tag data"
+                )
+
+    return element
 
 
 def _DataElement_from_raw(

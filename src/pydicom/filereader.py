@@ -12,7 +12,11 @@ import zlib
 from pydicom import config
 from pydicom.charset import default_encoding, convert_encodings
 from pydicom.config import logger
-from pydicom.datadict import _dictionary_vr_fast
+from pydicom.datadict import (
+    _dictionary_vr_fast,
+    make_private_dictionary_binding,
+    PrivateDictionaryBinding,
+)
 from pydicom.dataelem import (
     DataElement,
     RawDataElement,
@@ -45,6 +49,118 @@ from pydicom.valuerep import EXPLICIT_VR_LENGTH_32, VR as VR_
 ENCODED_VR = {vr.encode(default_encoding) for vr in VR_}
 
 
+def _is_private_creator_tag(group: int, element: int) -> bool:
+    """Return ``True`` if (`group`, `element`) is a private creator tag."""
+    return bool((group & 1) and 0x10 <= element < 0x100)
+
+
+def _maybe_collect_private_creator(
+    tag: int,
+    group: int,
+    element: int,
+    value: bytes | None,
+    is_little_endian: bool,
+    has_tag_set: bool,
+    tag_set: set[int],
+    private_creator_map: dict[int, str] | None,
+) -> bool:
+    """Record a scanned private creator and say whether to skip yielding it.
+
+    Private creator elements define the block of every private element in the
+    group, so they are always read and remembered.  With `specific_tags` they
+    are excluded from the returned tag set.
+    """
+    if not (
+        _is_private_creator_tag(group, element) and private_creator_map is not None
+    ):
+        return False
+
+    from pydicom.values import convert_string
+
+    private_creator_map[tag] = cast(
+        str, convert_string(cast(bytes, value) or b"", is_little_endian)
+    )
+    return has_tag_set and tag not in tag_set
+
+
+def _bound_private_vr(
+    tag: int,
+    group: int,
+    element: int,
+    private_binding: PrivateDictionaryBinding | None,
+    private_creator_map: dict[int, str] | None,
+) -> str | None:
+    """Return the VR of a private element from the bound overlay, if known."""
+    if private_binding is None or private_creator_map is None:
+        return None
+    if not (group & 1):
+        return None
+
+    creator = private_creator_map.get(group << 16 | (element >> 8))
+    if creator is None:
+        return None
+
+    return private_binding.private_VR(BaseTag(tag), creator)
+
+
+def _resolve_undefined_length_vr(
+    vr: str | None,
+    tag: int,
+    group: int,
+    elem: int,
+    fp: BinaryIO,
+    fp_read: Callable[[int], bytes],
+    fp_tell: Callable[[], int],
+    fp_seek: Callable[[int], int],
+    endian_chr: str,
+    private_binding: PrivateDictionaryBinding | None,
+    private_creator_map: dict[int, str] | None,
+) -> str | None:
+    """Resolve the VR of an undefined-length implicit/UN element."""
+    if not (vr is None or vr == VR_.UN and config.replace_un_with_known_vr):
+        return vr
+
+    try:
+        return _dictionary_vr_fast(tag)
+    except KeyError:
+        # A private element may be defined as a sequence by the private
+        # dictionary bound to this read (overlay first, then the global
+        # private dictionary). This cannot use the Dataset-based hook because
+        # the dataset does not exist yet.
+        if (
+            _bound_private_vr(tag, group, elem, private_binding, private_creator_map)
+            == VR_.SQ
+        ):
+            return VR_.SQ
+
+        # Look ahead to see if it consists of items and is thus a SQ
+        next_tag = _unpack_tag(fp_read(4), endian_chr)
+        # Rewind the file
+        fp_seek(fp_tell() - 4)
+        if next_tag == ItemTag:
+            return VR_.SQ
+
+    return vr
+
+
+def _attach_private_creator(
+    element: DataElement,
+    tag: int,
+    group: int,
+    elem: int,
+    private_creator_map: dict[int, str] | None,
+) -> DataElement:
+    """Attach the scanned private creator name to a yielded private element."""
+    if (
+        BaseTag(tag).is_private
+        and private_creator_map is not None
+    ):
+        creator = private_creator_map.get(group << 16 | (elem >> 8))
+        if creator:
+            element.private_creator = creator
+    return element
+
+
 def data_element_generator(
     fp: BinaryIO,
     is_implicit_VR: bool,
@@ -53,6 +169,8 @@ def data_element_generator(
     defer_size: int | str | float | None = None,
     encoding: str | MutableSequence[str] = default_encoding,
     specific_tags: list[BaseTag | int] | None = None,
+    private_binding: PrivateDictionaryBinding | None = None,
+    private_creator_map: dict[int, str] | None = None,
 ) -> Iterator[RawDataElement | DataElement]:
     """Create a generator to efficiently return the raw data elements.
 
@@ -80,6 +198,13 @@ def data_element_generator(
         Encoding scheme
     specific_tags : list or None
         See :func:`dcmread` for parameter info.
+    private_binding : PrivateDictionaryBinding, optional
+        The immutable private dictionary overlay bound to this read. Used to
+        identify an implicit-VR private sequence via the local definition.
+    private_creator_map : dict, optional
+        When `specific_tags` is used, private creator elements are not returned
+        but are still needed to interpret the selected private elements; their
+        tag to creator string mapping is collected here.
 
     Yields
     -------
@@ -213,9 +338,13 @@ def data_element_generator(
         # Reading the value
         # First case (most common): reading a value with a defined length
         if length != 0xFFFFFFFF:
-            # don't defer loading of Specific Character Set value as it is
-            # needed immediately to get the character encoding for other tags
-            if has_tag_set and tag not in tag_set:
+            # A private creator element defines the block (and therefore the
+            # interpretation) of every private element in the group. It must
+            # always be read (never deferred) and, when filtering with
+            # specific_tags, is collected into the creator map but excluded
+            # from the returned tag set.
+            is_private_creator = _is_private_creator_tag(group, elem)
+            if has_tag_set and tag not in tag_set and not is_private_creator:
                 # skip the tag if not in specific tags
                 fp_seek(fp_tell() + length)
                 continue
@@ -224,6 +353,7 @@ def data_element_generator(
                 defer_size is not None
                 and length > defer_size
                 and tag != 0x00080005  # charset
+                and not is_private_creator
             ):
                 # Flag as deferred by setting value to None, and skip bytes
                 value = None
@@ -260,6 +390,19 @@ def data_element_generator(
                 # for use with future elements (SQs)
                 encoding = convert_encodings(encoding)
 
+            if _maybe_collect_private_creator(
+                tag,
+                group,
+                elem,
+                value,
+                is_little_endian,
+                has_tag_set,
+                tag_set,
+                private_creator_map,
+            ):
+                # do not add the creator to the returned tag set
+                continue
+
             yield RawDataElement(
                 BaseTag(tag),
                 vr,
@@ -283,17 +426,19 @@ def data_element_generator(
             # if private tag, won't be able to look it up in dictionary,
             #   in which case just ignore it and read the bytes unless it is
             #   identified as a Sequence
-            if vr is None or vr == VR_.UN and config.replace_un_with_known_vr:
-                try:
-                    vr = _dictionary_vr_fast(tag)
-                except KeyError:
-                    # Look ahead to see if it consists of items
-                    # and is thus a SQ
-                    next_tag = _unpack_tag(fp_read(4), endian_chr)
-                    # Rewind the file
-                    fp_seek(fp_tell() - 4)
-                    if next_tag == ItemTag:
-                        vr = VR_.SQ
+            vr = _resolve_undefined_length_vr(
+                vr,
+                tag,
+                group,
+                elem,
+                fp,
+                fp_read,
+                fp_tell,
+                fp_seek,
+                endian_chr,
+                private_binding,
+                private_creator_map,
+            )
 
             if vr == VR_.SQ:
                 if debugging:
@@ -302,13 +447,21 @@ def data_element_generator(
                     )
 
                 seq = read_sequence(
-                    fp, is_implicit_VR, is_little_endian, length, encoding
+                    fp,
+                    is_implicit_VR,
+                    is_little_endian,
+                    length,
+                    encoding,
+                    private_binding=private_binding,
                 )
                 if has_tag_set and tag not in tag_set:
                     continue
 
-                yield DataElement(
+                yielded = DataElement(
                     BaseTag(tag), vr, seq, value_tell, is_undefined_length=True
+                )
+                yield _attach_private_creator(
+                    yielded, tag, group, elem, private_creator_map
                 )
             else:
                 if debugging:
@@ -414,6 +567,7 @@ def read_dataset(
     parent_encoding: str | MutableSequence[str] = default_encoding,
     specific_tags: list[BaseTag | int] | None = None,
     at_top_level: bool = True,
+    private_binding: PrivateDictionaryBinding | None = None,
 ) -> Dataset:
     """Return a :class:`~pydicom.dataset.Dataset` instance containing the next
     dataset in the file.
@@ -443,6 +597,10 @@ def read_dataset(
     at_top_level: bool
         If dataset is top level (not within a sequence).
         Used to turn off explicit VR heuristic within sequences
+    private_binding : PrivateDictionaryBinding, optional
+        The immutable private dictionary overlay bound to the read. Every
+        dataset of one read, including nested sequence items, shares the same
+        binding object.
 
     Returns
     -------
@@ -455,6 +613,15 @@ def read_dataset(
         A collection (dictionary) of DICOM
         :class:`~pydicom.dataelem.DataElement` instances.
     """
+    from pydicom.datadict import _active_private_binding
+
+    resolved_binding: PrivateDictionaryBinding | None
+    if private_binding is None:
+        resolved_binding = _active_private_binding.get()
+    else:
+        resolved_binding = private_binding
+
+    binding_token = _active_private_binding.set(resolved_binding)
     raw_data_elements: dict[BaseTag, RawDataElement | DataElement] = {}
     fp_tell = fp.tell
     fp_start = fp.tell()
@@ -462,6 +629,7 @@ def read_dataset(
         fp, is_implicit_VR, is_little_endian, stop_when, is_sequence=not at_top_level
     )
     fp.seek(fp_start)
+    private_creator_map: dict[int, str] = {}
     de_gen = data_element_generator(
         fp,
         is_implicit_VR,
@@ -470,6 +638,8 @@ def read_dataset(
         defer_size,
         parent_encoding,
         specific_tags,
+        resolved_binding,
+        private_creator_map,
     )
     try:
         if bytelength is None:
@@ -487,8 +657,12 @@ def read_dataset(
         warn_and_log(msg, UserWarning)
     except NotImplementedError as details:
         logger.error(details)
+    finally:
+        _active_private_binding.reset(binding_token)
 
     ds = Dataset(raw_data_elements, parent_encoding=parent_encoding)
+    ds._private_binding = resolved_binding
+    ds._private_creator_map = private_creator_map
 
     encoding: str | MutableSequence[str]
     if 0x00080005 in raw_data_elements:
@@ -511,6 +685,7 @@ def read_sequence(
     bytelength: int,
     encoding: str | MutableSequence[str],
     offset: int = 0,
+    private_binding: PrivateDictionaryBinding | None = None,
 ) -> Sequence:
     """Read and return a :class:`~pydicom.sequence.Sequence` -- i.e. a
     :class:`list` of :class:`Datasets<pydicom.dataset.Dataset>`.
@@ -527,7 +702,12 @@ def read_sequence(
         while (not bytelength) or (fp_tell() - fpStart < bytelength):
             file_tell = fp_tell()
             dataset = read_sequence_item(
-                fp, is_implicit_VR, is_little_endian, encoding, offset
+                fp,
+                is_implicit_VR,
+                is_little_endian,
+                encoding,
+                offset,
+                private_binding,
             )
             if dataset is None:  # None is returned if hit Sequence Delimiter
                 break
@@ -546,6 +726,7 @@ def read_sequence_item(
     is_little_endian: bool,
     encoding: str | MutableSequence[str],
     offset: int = 0,
+    private_binding: PrivateDictionaryBinding | None = None,
 ) -> Dataset | None:
     """Read and return a single :class:`~pydicom.sequence.Sequence` item, i.e.
     a :class:`~pydicom.dataset.Dataset`.
@@ -592,6 +773,7 @@ def read_sequence_item(
             bytelength=None,
             parent_encoding=encoding,
             at_top_level=False,
+            private_binding=private_binding,
         )
         ds.is_undefined_length_sequence_item = True
     else:
@@ -602,6 +784,7 @@ def read_sequence_item(
             length,
             parent_encoding=encoding,
             at_top_level=False,
+            private_binding=private_binding,
         )
         ds.is_undefined_length_sequence_item = False
 
@@ -802,6 +985,7 @@ def read_partial(
     defer_size: int | str | float | None = None,
     force: bool = False,
     specific_tags: list[BaseTag | int] | None = None,
+    private_binding: PrivateDictionaryBinding | None = None,
 ) -> FileDataset:
     """Parse a DICOM file until a condition is met.
 
@@ -817,6 +1001,8 @@ def read_partial(
         See :func:`dcmread` for parameter info.
     specific_tags : list or None
         See :func:`dcmread` for parameter info.
+    private_binding : PrivateDictionaryBinding, optional
+        The validated, immutable private dictionary overlay for the read.
 
     Notes
     -----
@@ -920,19 +1106,26 @@ def read_partial(
     # Try and decode the dataset
     #   By this point we should be at the start of the dataset and have
     #   the transfer syntax (whether read from the file meta or guessed at)
+    from pydicom.datadict import _active_private_binding
+
+    binding_token = _active_private_binding.set(private_binding)
     try:
-        dataset = read_dataset(
-            fileobj,
-            is_implicit_VR,
-            is_little_endian,
-            stop_when=stop_when,
-            defer_size=defer_size,
-            specific_tags=specific_tags,
-        )
-    except EOFError:
-        if config.settings.reading_validation_mode == config.RAISE:
-            raise
-        # warning already logged in read_dataset
+        try:
+            dataset = read_dataset(
+                fileobj,
+                is_implicit_VR,
+                is_little_endian,
+                stop_when=stop_when,
+                defer_size=defer_size,
+                specific_tags=specific_tags,
+                private_binding=private_binding,
+            )
+        except EOFError:
+            if config.settings.reading_validation_mode == config.RAISE:
+                raise
+            # warning already logged in read_dataset
+    finally:
+        _active_private_binding.reset(binding_token)
 
     # Add the command set elements to the dataset (if any)
     if command_set:
@@ -946,6 +1139,10 @@ def read_partial(
         is_implicit_VR,
         is_little_endian,
     )
+    # FileDataset.__init__ re-runs Dataset.__init__ and would otherwise drop
+    # the binding collected while parsing; re-attach the frozen interpretation
+    ds._private_binding = dataset._private_binding
+    ds._private_creator_map = dataset._private_creator_map
     # save the originally read transfer syntax properties in the dataset
     ds.set_original_encoding(is_implicit_VR, is_little_endian, dataset._character_set)
     return ds
@@ -957,6 +1154,8 @@ def dcmread(
     stop_before_pixels: bool = False,
     force: bool = False,
     specific_tags: TagListType | None = None,
+    *,
+    private_dictionary: dict[str, dict[tuple[int, int], tuple]] | None = None,
 ) -> FileDataset:
     """Read and parse a DICOM dataset stored in the DICOM File Format.
 
@@ -1011,6 +1210,24 @@ def dcmread(
         elements can be tags or keywords. Note that the element (0008,0005)
         *Specific Character Set* is always returned if present - this ensures
         correct decoding of returned text values.
+    private_dictionary : dict, optional
+        A keyword-only mapping of private creator name to a mapping of private
+        ``(group, offset)`` keys to ``(VR, VM, description, retired)`` tuples.
+        The group must be an odd :class:`int` between ``0x0001`` and
+        ``0xFFFF`` (``bool`` is not accepted) and the offset an :class:`int`
+        between ``0`` and ``255``. The VR must be a single definite DICOM VR
+        string, the VM a DICOM VM string such as ``'1'`` or ``'1-n'`` and
+        description and retired must be strings. Creators must be non-empty
+        strings. The mapping may be empty, in which case it is ignored.
+
+        It acts as an overlay for this read only: matching entries take
+        precedence over pydicom's built-in private dictionary, unmatched
+        private tags still use the built-in dictionary and standard tags are
+        unaffected. Nothing is written to the process-global private
+        dictionary, so concurrent reads may use different definitions for the
+        same creator. The interpretation is frozen when the read starts:
+        later changes to the mapping, to the global private dictionary or to
+        the returned datasets' elements do not affect elements already read.
 
     Returns
     -------
@@ -1024,6 +1241,9 @@ def dcmread(
         If `force` is ``False`` and the file is not a valid DICOM file.
     TypeError
         If `fp` is ``None`` or of an unsupported type.
+    ValueError
+        If `private_dictionary` contains an invalid creator, key or entry.
+        Validation happens before any byte of the input is read.
 
     See Also
     --------
@@ -1032,6 +1252,10 @@ def dcmread(
     pydicom.filereader.read_partial
         Only read part of a DICOM file, stopping on given conditions.
     """
+    # Validate and freeze the overlay before touching the input at all, so an
+    # invalid configuration never results in a partially read file
+    private_binding = make_private_dictionary_binding(private_dictionary)
+
     # Open file if not already a file object
     caller_owns_file = True
     fp = path_from_pathlike(fp)
@@ -1081,6 +1305,7 @@ def dcmread(
             defer_size=size_in_bytes(defer_size),
             force=force,
             specific_tags=specific_tags,
+            private_binding=private_binding,
         )
     finally:
         if not caller_owns_file:
@@ -1105,6 +1330,7 @@ def read_deferred_data_element(
     filename_or_obj: PathType | BinaryIO,
     timestamp: float | None,
     raw_data_elem: RawDataElement,
+    private_binding: PrivateDictionaryBinding | None = None,
 ) -> RawDataElement:
     """Read the previously deferred value from the file into memory
     and return a raw data element.
@@ -1126,6 +1352,9 @@ def read_deferred_data_element(
         read, if not a file-like.
     raw_data_elem : dataelem.RawDataElement
         The raw data element with no value set.
+    private_binding : PrivateDictionaryBinding, optional
+        The private dictionary overlay bound to the original read, so that a
+        deferred implicit-VR value is still decoded with the frozen VR.
 
     Returns
     -------
@@ -1171,7 +1400,11 @@ def read_deferred_data_element(
     # Seek back to the start of the deferred element
     fp.seek(raw_data_elem.value_tell - offset)
     elem_gen = data_element_generator(
-        fp, is_implicit_VR, is_little_endian, defer_size=None
+        fp,
+        is_implicit_VR,
+        is_little_endian,
+        defer_size=None,
+        private_binding=private_binding,
     )
 
     # Read the data element and check matches what was stored before

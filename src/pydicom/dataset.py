@@ -64,6 +64,7 @@ from pydicom.datadict import (
     get_private_entry,
 )
 from pydicom.dataelem import DataElement, convert_raw_data_element, RawDataElement
+from pydicom.datadict import PrivateDictionaryBinding
 from pydicom.filebase import ReadableBuffer, WriteableBuffer
 from pydicom.fileutil import path_from_pathlike, PathType
 from pydicom.misc import warn_and_log
@@ -418,6 +419,15 @@ class Dataset:
 
         # known private creator blocks
         self._private_blocks: dict[tuple[int, str], PrivateBlock] = {}
+
+        # The immutable private dictionary overlay this dataset was read with
+        # (None for datasets not produced by a bound read). Shared by every
+        # dataset of one read, including nested sequence items, so keeping the
+        # reference costs O(1) per dataset.
+        self._private_binding: PrivateDictionaryBinding | None = None
+        # Private creator tag -> creator string collected while scanning, used
+        # when the creator element itself was excluded by specific_tags
+        self._private_creator_map: dict[int, str] = {}
 
         self._pixel_array: numpy.ndarray | None = None
         self._pixel_array_opts: dict[str, Any] = {"use_pdh": False}
@@ -1065,15 +1075,31 @@ class Dataset:
                     src = self.buffer
 
                 elem = read_deferred_data_element(
-                    self.fileobj_type, src, self.timestamp, elem
+                    self.fileobj_type,
+                    src,
+                    self.timestamp,
+                    elem,
+                    private_binding=self._private_binding,
                 )
 
             if tag != BaseTag(0x00080005):
                 character_set = self.original_character_set or self._character_set
             else:
                 character_set = default_encoding
-            # Not converted from raw form read from file yet; do so now
-            self[tag] = convert_raw_data_element(elem, encoding=character_set, ds=self)
+            # Not converted from raw form read from file yet; do so now.
+            # The binding of this dataset is re-activated so that the element
+            # keeps its frozen VR/description even if the global private
+            # dictionary has changed since the read.
+            from pydicom.datadict import _active_private_binding
+
+            token = _active_private_binding.set(self._private_binding)
+            try:
+                converted = convert_raw_data_element(
+                    elem, encoding=character_set, ds=self
+                )
+            finally:
+                _active_private_binding.reset(token)
+            self[tag] = converted
 
             # On initial read of the dataset, propagate the pixel representation
             #   (if any) to child datasets in any sequences.
@@ -1298,6 +1324,8 @@ class Dataset:
         ds = Dataset({tag: self.get_item(tag) for tag in tags})
         is_implicit, is_little = self.original_encoding
         ds.set_original_encoding(is_implicit, is_little, self.original_character_set)
+        ds._private_binding = self._private_binding
+        ds._private_creator_map = self._private_creator_map
         if not config._use_future:
             ds._is_little_endian = self.is_little_endian
             ds._is_implicit_VR = self.is_implicit_VR
@@ -2785,9 +2813,15 @@ class Dataset:
             private_creator_tag = Tag(elem_tag.group, private_block)
             if private_creator_tag in self and elem_tag != private_creator_tag:
                 if isinstance(elem, RawDataElement):
-                    elem = convert_raw_data_element(
-                        elem, encoding=self._character_set, ds=self
-                    )
+                    from pydicom.datadict import _active_private_binding
+
+                    token = _active_private_binding.set(self._private_binding)
+                    try:
+                        elem = convert_raw_data_element(
+                            elem, encoding=self._character_set, ds=self
+                        )
+                    finally:
+                        _active_private_binding.reset(token)
                 elem.private_creator = self[private_creator_tag].value
 
         # Changing pixel data resets the stored array

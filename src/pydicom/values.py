@@ -618,8 +618,16 @@ def convert_SQ(
     """
     encodings = encoding or [default_encoding]
     fp = BytesIO(byte_string)
+    from pydicom.datadict import get_active_private_binding
+
     seq = read_sequence(
-        fp, is_implicit_VR, is_little_endian, len(byte_string), encodings, offset
+        fp,
+        is_implicit_VR,
+        is_little_endian,
+        len(byte_string),
+        encodings,
+        offset,
+        private_binding=get_active_private_binding(),
     )
     return seq
 

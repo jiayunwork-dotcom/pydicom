@@ -4,7 +4,11 @@ from typing import Any, TYPE_CHECKING, Protocol
 from collections.abc import MutableSequence, Callable
 
 from pydicom import config
-from pydicom.datadict import dictionary_VR, private_dictionary_VR
+from pydicom.datadict import (
+    dictionary_VR,
+    private_dictionary_VR,
+    get_active_private_binding,
+)
 from pydicom.errors import BytesLengthException
 from pydicom.misc import warn_and_log
 from pydicom.tag import BaseTag, _LUT_DESCRIPTOR_TAGS
@@ -117,6 +121,31 @@ class Hooks:
             raise ValueError(f"Unknown hook '{hook}'")
 
 
+def _private_creator_for_tag(ds: "Dataset | None", tag: BaseTag) -> str | None:
+    """Return the private creator string defining `tag` in `ds`.
+
+    The creator is normally stored as a private creator element.  When reading
+    with ``specific_tags`` the creator element itself may not have been kept,
+    in which case it is taken from the dataset's private creator map collected
+    while scanning the input.
+    """
+    if ds is None or not (tag.element & 0xFF00):
+        return None
+
+    private_creator_tag = BaseTag(tag.group << 16 | (tag.element >> 8))
+    creator_elem = ds._dict.get(private_creator_tag)
+    if creator_elem is not None:
+        # RawDataElement exposes the raw, possibly space padded LO value
+        creator = getattr(creator_elem, "value", None)
+        if isinstance(creator, str):
+            return creator.rstrip()
+        if isinstance(creator, bytes):
+            return creator.rstrip(b" \x00").decode("latin-1", errors="replace")
+        return creator
+
+    return ds._private_creator_map.get(int(private_creator_tag))
+
+
 def _private_vr_for_tag(ds: "Dataset | None", tag: BaseTag) -> str:
     """Return the VR for a known private tag, otherwise "UN".
 
@@ -133,18 +162,26 @@ def _private_vr_for_tag(ds: "Dataset | None", tag: BaseTag) -> str:
     -------
     str
         "LO" if the tag is a private creator, the VR of the private tag if
-        found in the private dictionary, or "UN".
+        found in the private dictionary bound to the current read or in the
+        global private dictionary, or "UN".
     """
     if tag.is_private_creator:
         return VR.LO
 
     # invalid private tags are handled as UN
     if ds is not None and (tag.element & 0xFF00):
-        private_creator_tag = tag.group << 16 | (tag.element >> 8)
-        private_creator = ds.get(private_creator_tag, "")
+        private_creator = _private_creator_for_tag(ds, tag)
         if private_creator:
+            # The binding of the current read takes precedence over the
+            # global private dictionary and stays fixed for the read.
+            binding = get_active_private_binding()
+            if binding is not None:
+                bound_vr = binding.private_VR(tag, private_creator)
+                if bound_vr is not None:
+                    return bound_vr
+
             try:
-                return private_dictionary_VR(tag, private_creator.value)
+                return private_dictionary_VR(tag, private_creator)
             except KeyError:
                 pass
 

@@ -4,6 +4,18 @@ Version 3.1.0
 Enhancements
 ------------
 
+* Added a keyword-only ``private_dictionary`` argument to
+  :func:`~pydicom.filereader.dcmread` for a private dictionary overlay that is
+  bound to that single read only. The mapping of private creator to
+  ``(group, offset) -> (VR, VM, description, retired)`` entries is validated
+  and frozen before the input is read, takes precedence over the built-in
+  private dictionary, never modifies the process-global dictionary and is
+  shared (not copied) by every dataset of the read, including nested sequence
+  items. The frozen interpretation survives element conversion, deferred
+  reads, :meth:`Dataset.copy<pydicom.dataset.Dataset.copy>`,
+  :func:`copy.deepcopy` and pickling, and allows different threads to use
+  different definitions for the same private creator concurrently.
+
 * Added support for lazily retrieving bulk data values referenced by a
   "BulkDataURI" in the DICOM JSON Model through the new ``lazy_bulk_data``
   keyword argument of :meth:`~pydicom.dataset.Dataset.from_json`. With lazy

@@ -40,3 +40,6 @@ Private Data Dictionary
    private_dictionary_description
    private_dictionary_VM
    private_dictionary_VR
+   PrivateDictionaryBinding
+   make_private_dictionary_binding
+   get_active_private_binding
